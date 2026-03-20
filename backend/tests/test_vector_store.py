@@ -1,0 +1,184 @@
+from types import SimpleNamespace
+
+import pytest
+
+from core import vector_store
+
+
+class DummyCollection:
+    def __init__(self, *, query_error: Exception | None = None):
+        self.query_error = query_error
+        self.upserts: list[dict] = []
+        self.records: dict[str, dict] = {}
+
+    def upsert(self, *, ids, embeddings, documents, metadatas):
+        self.upserts.append(
+            {
+                "ids": ids,
+                "embeddings": embeddings,
+                "documents": documents,
+                "metadatas": metadatas,
+            }
+        )
+        for idx, record_id in enumerate(ids):
+            self.records[str(record_id)] = {
+                "document": documents[idx],
+                "metadata": metadatas[idx],
+            }
+
+    def query(self, **kwargs):
+        if self.query_error:
+            raise self.query_error
+        ids = list(self.records.keys())[: kwargs["n_results"]]
+        return {
+            "ids": [ids],
+            "documents": [[self.records[record_id]["document"] for record_id in ids]],
+            "metadatas": [[self.records[record_id]["metadata"] for record_id in ids]],
+            "distances": [[0.0 for _ in ids]],
+        }
+
+    def count(self):
+        return len(self.records)
+
+    def get(self, ids=None, include=None):
+        target_ids = ids or list(self.records.keys())
+        return {
+            "ids": list(target_ids),
+            "documents": [self.records.get(str(record_id), {}).get("document", "") for record_id in target_ids],
+            "metadatas": [self.records.get(str(record_id), {}).get("metadata", {}) for record_id in target_ids],
+        }
+
+
+class DummyClient:
+    def __init__(self, path: str, collection: DummyCollection):
+        self.path = path
+        self._collection = collection
+        self.deleted: list[str] = []
+
+    def get_or_create_collection(self, name: str):
+        return self._collection
+
+    def delete_collection(self, name: str):
+        self.deleted.append(name)
+
+
+def _patch_vector_dependencies(monkeypatch, *, collection: DummyCollection, embedding_model: str = "gemini-embedding-001", world_dir=None):
+    monkeypatch.setattr(
+        vector_store.chromadb,
+        "PersistentClient",
+        lambda path: DummyClient(path, collection),
+    )
+    monkeypatch.setattr(vector_store, "get_world_embedding_model", lambda world_id: embedding_model)
+    monkeypatch.setattr(vector_store, "load_settings", lambda: {"embedding_model": embedding_model})
+    monkeypatch.setattr(vector_store, "set_world_embedding_model", lambda world_id, model: None)
+    if world_dir is not None:
+        monkeypatch.setattr(vector_store, "world_chroma_dir", lambda world_id: world_dir)
+
+
+def test_vector_store_prefers_world_embedding_model(monkeypatch):
+    captured: dict[str, str] = {}
+    collection = DummyCollection()
+
+    class DummyModels:
+        def embed_content(self, *, model: str, contents: str):
+            captured["model"] = model
+            captured["content"] = contents
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.1, 0.2, 0.3])])
+
+    class DummyGenAIClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels()
+
+    _patch_vector_dependencies(monkeypatch, collection=collection, embedding_model="models/text-embedding-004")
+    monkeypatch.setattr(vector_store.genai, "Client", DummyGenAIClient)
+
+    store = vector_store.VectorStore("world-123")
+    embedding = store.embed_text("hello world", api_key="test-key")
+
+    assert embedding == [0.1, 0.2, 0.3]
+    assert captured["model"] == "models/text-embedding-004"
+    assert captured["content"] == "hello world"
+
+
+def test_vector_store_embed_texts_batches_multiple_contents(monkeypatch):
+    captured: dict[str, object] = {}
+    collection = DummyCollection()
+
+    class DummyModels:
+        def embed_content(self, *, model: str, contents):
+            captured["model"] = model
+            captured["contents"] = contents
+            return SimpleNamespace(
+                embeddings=[
+                    SimpleNamespace(values=[0.1, 0.2]),
+                    SimpleNamespace(values=[0.3, 0.4]),
+                ]
+            )
+
+    class DummyGenAIClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels()
+
+    _patch_vector_dependencies(monkeypatch, collection=collection, embedding_model="gemini-embedding-001")
+    monkeypatch.setattr(vector_store.genai, "Client", DummyGenAIClient)
+
+    store = vector_store.VectorStore("world-123")
+    embeddings = store.embed_texts(["first", "second"], api_key="test-key")
+
+    assert embeddings == [[0.1, 0.2], [0.3, 0.4]]
+    assert captured["model"] == "gemini-embedding-001"
+    assert captured["contents"] == ["first", "second"]
+
+
+def test_vector_store_query_blocks_when_manifest_model_is_stale(monkeypatch):
+    collection = DummyCollection()
+    manifest = {"collections": {}}
+
+    class DummyModels:
+        def embed_content(self, *, model: str, contents: str):
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.4, 0.5, 0.6])])
+
+    class DummyGenAIClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels()
+
+    _patch_vector_dependencies(monkeypatch, collection=collection, embedding_model="new-model")
+    monkeypatch.setattr(vector_store.genai, "Client", DummyGenAIClient)
+    monkeypatch.setattr(vector_store.VectorStore, "_load_manifest", lambda self: manifest)
+    monkeypatch.setattr(vector_store.VectorStore, "_save_manifest", lambda self, data: manifest.update(data))
+
+    store = vector_store.VectorStore("world-123", collection_suffix="nodes")
+    store.collection.records["node-1"] = {"document": "Node doc", "metadata": {}}
+    store._set_recorded_embedding_model("old-model")
+
+    with pytest.raises(RuntimeError) as exc:
+        store.query_by_embedding([0.1, 0.2, 0.3], n_results=1)
+
+    assert "different embedding model" in str(exc.value)
+
+
+def test_vector_store_query_dimension_mismatch_requires_rebuild(monkeypatch):
+    collection = DummyCollection(query_error=RuntimeError("dimension mismatch"))
+    manifest = {"collections": {}}
+
+    class DummyModels:
+        def embed_content(self, *, model: str, contents: str):
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.9, 0.8, 0.7])])
+
+    class DummyGenAIClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels()
+
+    _patch_vector_dependencies(monkeypatch, collection=collection, embedding_model="gemini-embedding-001")
+    monkeypatch.setattr(vector_store.genai, "Client", DummyGenAIClient)
+    monkeypatch.setattr(vector_store.VectorStore, "_load_manifest", lambda self: manifest)
+    monkeypatch.setattr(vector_store.VectorStore, "_save_manifest", lambda self, data: manifest.update(data))
+
+    store = vector_store.VectorStore("world-xyz", collection_suffix="nodes")
+    store.collection.records["node-1"] = {"document": "Node doc", "metadata": {}}
+    store._set_recorded_embedding_model("gemini-embedding-001")
+
+    with pytest.raises(RuntimeError) as exc:
+        store.query_by_embedding([0.9, 0.8, 0.7], n_results=1)
+
+    assert "Re-embed All or Rechunk And Re-ingest" in str(exc.value)

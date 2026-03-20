@@ -1,0 +1,108 @@
+import json
+
+from core import config
+from routers import settings as settings_router
+
+
+def test_load_settings_includes_entity_resolution_defaults(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
+
+    loaded = config.load_settings()
+
+    assert loaded["entity_resolution_top_k"] == 50
+    assert loaded["default_model_entity_chooser"] == "gemini-2.0-flash"
+    assert loaded["default_model_entity_combiner"] == "gemini-2.5-pro-preview-05-06"
+    assert loaded["entity_resolution_chooser_prompt"] is None
+    assert loaded["entity_resolution_combiner_prompt"] is None
+    assert loaded["graph_architect_prompt"] is None
+
+
+def test_prompt_keys_expose_graph_and_entity_resolution_prompts():
+    expected = {
+        "graph_architect_prompt",
+        "entity_resolution_chooser_prompt",
+        "entity_resolution_combiner_prompt",
+        "chat_system_prompt",
+    }
+
+    assert expected.issubset(set(settings_router.PROMPT_KEYS))
+
+
+def test_load_prompt_prefers_custom_settings_and_falls_back_to_default(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    prompts_path = tmp_path / "default_prompts.json"
+
+    settings_path.write_text(
+        json.dumps(
+            {
+                "entity_resolution_chooser_prompt": "custom chooser prompt",
+            }
+        ),
+        encoding="utf-8",
+    )
+    prompts_path.write_text(
+        json.dumps(
+            {
+                "graph_architect_prompt": "default graph prompt",
+                "entity_resolution_chooser_prompt": "default chooser prompt",
+                "entity_resolution_combiner_prompt": "default combiner prompt",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
+    monkeypatch.setattr(config, "DEFAULT_PROMPTS_FILE", prompts_path)
+
+    assert config.load_prompt("entity_resolution_chooser_prompt") == "custom chooser prompt"
+    assert config.load_prompt("graph_architect_prompt") == "default graph prompt"
+    assert config.load_prompt("entity_resolution_combiner_prompt") == "default combiner prompt"
+
+
+def test_load_settings_normalizes_stage_specific_concurrency_controls(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(
+        json.dumps(
+            {
+                "ingestion_concurrency": 3,
+                "graph_extraction_concurrency": 0,
+                "graph_extraction_cooldown_seconds": -5,
+                "embedding_concurrency": -2,
+                "embedding_cooldown_seconds": -1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
+
+    loaded = config.load_settings()
+
+    assert loaded["graph_extraction_concurrency"] == 1
+    assert loaded["graph_extraction_cooldown_seconds"] == 0.0
+    assert loaded["embedding_concurrency"] == 1
+    assert loaded["embedding_cooldown_seconds"] == 0.0
+
+
+def test_save_settings_persists_stage_specific_controls_with_validation(tmp_path, monkeypatch):
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
+
+    config.save_settings(
+        {
+            "graph_extraction_concurrency": 6,
+            "graph_extraction_cooldown_seconds": 2.5,
+            "embedding_concurrency": 12,
+            "embedding_cooldown_seconds": -4,
+        }
+    )
+
+    saved = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    assert saved["graph_extraction_concurrency"] == 6
+    assert saved["graph_extraction_cooldown_seconds"] == 2.5
+    assert saved["embedding_concurrency"] == 12
+    assert saved["embedding_cooldown_seconds"] == 0.0

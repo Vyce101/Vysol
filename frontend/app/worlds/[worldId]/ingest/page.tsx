@@ -1,0 +1,1099 @@
+"use client";
+
+import { useState, useEffect, useRef, use } from "react";
+import { Upload, FileText, Trash2, Play, ChevronDown, ChevronUp, CheckCircle, XCircle, Loader2 } from "lucide-react";
+import EntityResolutionPanel from "@/components/EntityResolutionPanel";
+import { apiFetch, apiUpload, apiStreamGet } from "@/lib/api";
+
+interface Source {
+    source_id: string;
+    original_filename: string;
+    vault_filename: string;
+    book_number: number;
+    display_name: string;
+    status: string;
+    chunk_count: number;
+    ingested_at: string | null;
+    failed_chunks?: number[];
+    extracted_chunks?: number[];
+    embedded_chunks?: number[];
+    stage_failures?: StageFailure[];
+}
+
+interface StageFailure {
+    stage: "extraction" | "embedding";
+    chunk_index: number;
+    chunk_id: string;
+    source_id: string;
+    book_number: number;
+    error_type: string;
+    error_message: string;
+    attempt_count: number;
+    last_attempt_at: string;
+    display_name?: string;
+}
+
+interface StageCounters {
+    expected_chunks: number;
+    extracted_chunks: number;
+    embedded_chunks: number;
+    failed_records: number;
+    sources_total: number;
+    sources_complete: number;
+    sources_partial_failure: number;
+    synthesized_failures: number;
+}
+
+interface Checkpoint {
+    can_resume: boolean;
+    chunk_index: number;
+    chunks_total: number;
+    reason: string | null;
+    stage_counters?: StageCounters;
+    failures?: StageFailure[];
+    active_ingestion_run?: boolean;
+    progress_phase?: "extracting" | "embedding" | "aborting" | "idle";
+    completed_chunks_current_phase?: number;
+    total_chunks_current_phase?: number;
+    progress_percent?: number;
+    active_operation?: string;
+}
+
+interface IngestSettings {
+    chunk_size_chars: number;
+    chunk_overlap_chars: number;
+    embedding_model: string;
+    locked_at?: string | null;
+    last_ingest_settings_at?: string | null;
+}
+
+interface WorldResponse {
+    ingestion_status?: string;
+    ingest_settings?: IngestSettings;
+    active_ingestion_run?: boolean;
+}
+
+interface SettingsResponse {
+    glean_amount?: number;
+}
+
+interface LogEntry {
+    event?: string;
+    status?: string;
+    ingestion_status?: string;
+    active_ingestion_run?: boolean;
+    chunk_index?: number;
+    chunks_total?: number;
+    source_id?: string;
+    active_agent?: string;
+    agent?: string;
+    node_count?: number;
+    edge_count?: number;
+    claim_count?: number;
+    chunk_vector_count?: number;
+    node_vector_count?: number;
+    safety_reason?: string;
+    chunk_text?: string;
+    error_type?: string;
+    message?: string;
+    book_number?: number;
+    progress_phase?: "extracting" | "embedding" | "aborting" | "idle";
+    completed_chunks_current_phase?: number;
+    total_chunks_current_phase?: number;
+    progress_percent?: number;
+    active_operation?: string;
+}
+
+interface ProgressState {
+    completed: number;
+    total: number;
+    percent: number;
+    phase: "extracting" | "embedding" | "aborting" | "idle";
+    agent: string;
+    operation: string;
+}
+
+export default function IngestPage({ params }: { params: Promise<{ worldId: string }> }) {
+    const { worldId } = use(params);
+    const initialProgress: ProgressState = {
+        completed: 0,
+        total: 0,
+        percent: 0,
+        phase: "idle",
+        agent: "",
+        operation: "default",
+    };
+    const [sources, setSources] = useState<Source[]>([]);
+    const [checkpoint, setCheckpoint] = useState<Checkpoint | null>(null);
+    const [ingesting, setIngesting] = useState(false);
+    const [isAborting, setIsAborting] = useState(false);
+    const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+    const [progress, setProgress] = useState(initialProgress);
+    const [showLog, setShowLog] = useState(true);
+    const [showSettings, setShowSettings] = useState(false);
+    const [showPrompts, setShowPrompts] = useState(false);
+    const [dragOver, setDragOver] = useState(false);
+    const logEndRef = useRef<HTMLDivElement>(null);
+    const fileRef = useRef<HTMLInputElement>(null);
+    const esRef = useRef<EventSource | null>(null);
+
+    // Settings state
+    const [chunkSize, setChunkSize] = useState(4000);
+    const [chunkOverlap, setChunkOverlap] = useState(150);
+    const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-002-preview");
+    const [savedIngestSettings, setSavedIngestSettings] = useState<IngestSettings | null>(null);
+    const [gleanAmount, setGleanAmount] = useState(1);
+    const [prompts, setPrompts] = useState<Record<string, { value: string; source: string }>>({});
+    const [blockedChunkData, setBlockedChunkData] = useState<{ text: string; reason: string } | null>(null);
+
+    const resetProgress = () => setProgress(initialProgress);
+    const isTerminalIngestionStatus = (status?: string | null) => Boolean(status && status !== "in_progress");
+
+    const syncProgressFromPayload = (payload?: Partial<Checkpoint & LogEntry>) => {
+        if (!payload) return;
+        const explicitTotal = Number(payload.total_chunks_current_phase ?? 0);
+        const explicitCompleted = Number(payload.completed_chunks_current_phase ?? 0);
+        const fallbackTotal = Number(payload.chunks_total ?? 0);
+        const fallbackCompleted = Number(payload.chunk_index ?? 0);
+        const total = explicitTotal > 0 ? explicitTotal : Math.max(0, fallbackTotal);
+        const completed = total > 0
+            ? Math.max(0, Math.min(total, explicitTotal > 0 ? explicitCompleted : fallbackCompleted))
+            : 0;
+        const percent = total > 0
+            ? Math.max(0, Math.min(100, Number(payload.progress_percent ?? ((completed / total) * 100))))
+            : 0;
+        setProgress((prev) => ({
+            completed,
+            total,
+            percent,
+            phase: payload.progress_phase || prev.phase,
+            agent: payload.active_agent || payload.agent || prev.agent,
+            operation: payload.active_operation || prev.operation,
+        }));
+    };
+
+    async function loadSettings() {
+        try {
+            const data = await apiFetch<SettingsResponse>(`/settings`);
+            if (data.glean_amount !== undefined) setGleanAmount(data.glean_amount);
+        } catch { /* ignore */ }
+    }
+
+    async function loadWorld() {
+        try {
+            const data = await apiFetch<WorldResponse>(`/worlds/${worldId}`);
+            if (data.ingest_settings) {
+                setSavedIngestSettings(data.ingest_settings);
+                setChunkSize(data.ingest_settings.chunk_size_chars);
+                setChunkOverlap(data.ingest_settings.chunk_overlap_chars);
+                setEmbeddingModel(data.ingest_settings.embedding_model);
+            }
+            const liveRun = data.ingestion_status === "in_progress" && data.active_ingestion_run === true;
+            if (liveRun) {
+                setIngesting(true);
+                setIsAborting(false);
+                connectToSSE();
+            } else {
+                esRef.current?.close();
+                setIngesting(false);
+                setIsAborting(false);
+            }
+        } catch { /* ignore */ }
+    }
+
+    async function loadSources() {
+        try {
+            const data = await apiFetch<Source[]>(`/worlds/${worldId}/sources`);
+            setSources(data);
+        } catch { /* ignore */ }
+    }
+
+    async function loadCheckpoint() {
+        try {
+            const data = await apiFetch<Checkpoint>(`/worlds/${worldId}/ingest/checkpoint`);
+            setCheckpoint(data);
+            syncProgressFromPayload(data);
+            setIsAborting(data.progress_phase === "aborting");
+        } catch { /* ignore */ }
+    }
+
+    async function loadPrompts() {
+        try {
+            const data = await apiFetch<Record<string, { value: string; source: string }>>(`/settings/prompts`);
+            setPrompts(data);
+        } catch { /* ignore */ }
+    }
+
+    const handleUpload = async (files: FileList | File[]) => {
+        for (const file of Array.from(files)) {
+            if (!file.name.endsWith(".txt")) {
+                alert("Only .txt files are supported.");
+                continue;
+            }
+            const formData = new FormData();
+            formData.append("file", file);
+            try {
+                await apiUpload(`/worlds/${worldId}/sources`, formData);
+            } catch (err: unknown) {
+                alert((err as Error).message);
+            }
+        }
+        loadSources();
+    };
+
+    const handleDrop = (e: React.DragEvent) => {
+        e.preventDefault();
+        setDragOver(false);
+        if (e.dataTransfer.files.length > 0) handleUpload(e.dataTransfer.files);
+    };
+
+    const connectToSSE = () => {
+        if (esRef.current) esRef.current.close();
+        esRef.current = apiStreamGet(
+            `/worlds/${worldId}/ingest/status`,
+            (data) => {
+                const entry = data as LogEntry;
+                setLogEntries((prev) => [...prev, entry]);
+                syncProgressFromPayload(entry);
+                if (entry.event === "aborting" || entry.progress_phase === "aborting") {
+                    setIsAborting(true);
+                    setIngesting(true);
+                }
+                const terminalStatus = entry.ingestion_status || entry.status;
+                const isTerminalEvent = (
+                    entry.event === "complete"
+                    || entry.event === "aborted"
+                    || (entry.event === "status" && isTerminalIngestionStatus(entry.ingestion_status))
+                );
+                if (isTerminalEvent || (entry.active_ingestion_run === false && isTerminalIngestionStatus(terminalStatus))) {
+                    esRef.current?.close();
+                    setIngesting(false);
+                    setIsAborting(false);
+                    void loadWorld();
+                    void loadSources();
+                    void loadCheckpoint();
+                }
+            },
+            () => {
+                esRef.current?.close();
+                setIngesting(false);
+                setIsAborting(false);
+                void loadWorld();
+                void loadSources();
+                void loadCheckpoint();
+            },
+            (err) => {
+                esRef.current?.close();
+                setIngesting(false);
+                setIsAborting(false);
+                void loadWorld();
+                void loadSources();
+                void loadCheckpoint();
+                setLogEntries((prev) => [...prev, { event: "error", message: err.message }]);
+            }
+        );
+    };
+
+    /* eslint-disable react-hooks/exhaustive-deps */
+    // These loaders are scoped to the current world id and intentionally rerun only on world changes.
+    useEffect(() => {
+        const initializePage = async () => {
+            await Promise.all([
+                loadWorld(),
+                loadSources(),
+                loadCheckpoint(),
+                loadSettings(),
+                loadPrompts(),
+            ]);
+        };
+        void initializePage();
+    }, [worldId]);
+    /* eslint-enable react-hooks/exhaustive-deps */
+    useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [logEntries]);
+
+    const buildIngestSettingsPayload = () => ({
+        chunk_size_chars: chunkSize,
+        chunk_overlap_chars: chunkOverlap,
+        embedding_model: embeddingModel.trim(),
+    });
+
+    const startIngestion = async (
+        resume: boolean,
+        operation: "default" | "rechunk_reingest" | "reembed_all" = "default",
+    ) => {
+        resetProgress();
+        setIngesting(true);
+        setLogEntries([]);
+        try {
+            await apiFetch(`/worlds/${worldId}/ingest/start`, {
+                method: "POST",
+                body: JSON.stringify({
+                    resume,
+                    operation,
+                    ingest_settings: buildIngestSettingsPayload(),
+                }),
+            });
+            connectToSSE();
+        } catch (err: unknown) {
+            setIngesting(false);
+            alert((err as Error).message);
+        }
+    };
+
+    const retryFailures = async (stage: "extraction" | "embedding" | "all") => {
+        resetProgress();
+        setIngesting(true);
+        setLogEntries([]);
+        try {
+            await apiFetch(`/worlds/${worldId}/ingest/retry`, {
+                method: "POST",
+                body: JSON.stringify({ stage }),
+            });
+            connectToSSE();
+        } catch (err: unknown) {
+            setIngesting(false);
+            alert((err as Error).message);
+        }
+    };
+
+    const abortIngestion = async () => {
+        try {
+            setIsAborting(true);
+            await apiFetch(`/worlds/${worldId}/ingest/abort`, { method: "POST" });
+        } catch {
+            setIsAborting(false);
+        }
+    };
+
+    const deleteSource = async (sourceId: string) => {
+        try {
+            await apiFetch(`/worlds/${worldId}/sources/${sourceId}`, { method: "DELETE" });
+            void loadWorld();
+            void loadSources();
+        } catch (err: unknown) {
+            alert((err as Error).message);
+        }
+    };
+
+    const savePrompt = async (key: string, value: string) => {
+        try {
+            await apiFetch("/settings/prompts", {
+                method: "POST",
+                body: JSON.stringify({ key, value }),
+            });
+            loadPrompts();
+        } catch { /* ignore */ }
+    };
+
+    const resetPrompt = async (key: string) => {
+        try {
+            await apiFetch(`/settings/prompts/reset/${key}`, { method: "POST" });
+            loadPrompts();
+        } catch { /* ignore */ }
+    };
+
+    const saveAgentSettings = async () => {
+        try {
+            await apiFetch("/settings", {
+                method: "POST",
+                body: JSON.stringify({
+                    glean_amount: gleanAmount,
+                }),
+            });
+        } catch { /* ignore */ }
+    };
+
+    const hasPending = sources.some((s) => s.status === "pending" || s.status === "ingesting");
+    const hasRetryableFailures = sources.some(
+        (s) => s.status === "partial_failure"
+            || (s.failed_chunks?.length ?? 0) > 0
+            || (s.stage_failures?.length ?? 0) > 0
+    );
+    const hasAnyIngested = sources.some((s) => s.chunk_count > 0 || s.ingested_at !== null || s.status === "partial_failure" || s.status === "complete");
+    const allComplete = sources.length > 0 && sources.every((s) => s.status === "complete");
+    const chunkSettingsChanged = Boolean(savedIngestSettings) && (
+        chunkSize !== savedIngestSettings.chunk_size_chars
+        || chunkOverlap !== savedIngestSettings.chunk_overlap_chars
+    );
+    const embeddingModelChanged = Boolean(savedIngestSettings) && embeddingModel.trim() !== savedIngestSettings.embedding_model;
+    const showRechunkAction = !ingesting && hasAnyIngested;
+    const showReembedAction = !ingesting && hasAnyIngested;
+    const hasPendingWorldSettingChange = chunkSettingsChanged || embeddingModelChanged;
+    const canResolveEntities = !ingesting && !hasPending && hasAnyIngested;
+    const showResume = Boolean(checkpoint?.can_resume) && !ingesting && (hasPending || hasRetryableFailures);
+    const stageCounters = checkpoint?.stage_counters;
+    const failureRecords = checkpoint?.failures || [];
+    const hasProgress = progress.total > 0;
+    const showCompletedIdleState = !ingesting && !hasPending && allComplete && !hasRetryableFailures && !showResume;
+    const progressLabel = progress.phase === "aborting"
+        ? "Aborting"
+        : progress.phase === "embedding"
+            ? "Embedding"
+            : progress.phase === "extracting"
+                ? "Extraction"
+                : "Progress";
+
+    const agentPipeline = [
+        {
+            key: "graph_architect",
+            label: "Graph Architect",
+            matches: [
+                "graph_architect",
+                ...Array.from({ length: Math.max(0, gleanAmount) }, (_, index) => `graph_architect_glean_${index + 1}`),
+            ],
+        },
+    ];
+    const isVectorMaintenanceProgress = ["embedding_rebuild", "embedding_retry", "node_embedding_rebuild", "node_embedding"].includes(progress.agent);
+    const progressStages = isVectorMaintenanceProgress
+        ? [
+            {
+                key: "chunk_vectors",
+                label: progress.agent === "embedding_retry" ? "Chunk Embedding" : "Chunk Re-embed",
+                matches: ["embedding_rebuild", "embedding_retry"],
+            },
+            {
+                key: "node_vectors",
+                label: progress.agent === "node_embedding" ? "Node Embedding" : "Node Re-embed",
+                matches: ["node_embedding_rebuild", "node_embedding"],
+            },
+        ]
+        : agentPipeline;
+
+    return (
+        <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+            {/* Left Panel — Source Management */}
+            <div style={{ width: 380, flexShrink: 0, borderRight: "1px solid var(--border)", overflowY: "auto", padding: 20 }}>
+                <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16 }}>Sources</h2>
+
+                {/* Drop zone */}
+                <div
+                    onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+                    onDragLeave={() => setDragOver(false)}
+                    onDrop={handleDrop}
+                    onClick={() => fileRef.current?.click()}
+                    style={{
+                        border: `2px dashed ${dragOver ? "var(--primary)" : "var(--border)"}`,
+                        borderRadius: "var(--radius)",
+                        padding: "24px 16px",
+                        textAlign: "center",
+                        cursor: "pointer",
+                        marginBottom: 16,
+                        transition: "border-color 0.2s",
+                        background: dragOver ? "var(--primary-soft)" : "transparent",
+                    }}
+                >
+                    <Upload size={24} style={{ color: "var(--text-muted)", marginBottom: 8 }} />
+                    <div style={{ fontSize: 14, color: "var(--text-subtle)" }}>Drop .txt file here or <span style={{ color: "var(--primary-light)" }}>Browse</span></div>
+                    <input ref={fileRef} type="file" accept=".txt" multiple style={{ display: "none" }} onChange={(e) => e.target.files && handleUpload(e.target.files)} />
+                </div>
+
+                {/* Source list */}
+                {sources.map((s) => (
+                    <div key={s.source_id} style={{
+                        display: "flex", alignItems: "center", justifyContent: "space-between",
+                        padding: "10px 12px", background: "var(--background)", borderRadius: 8, marginBottom: 6,
+                        border: "1px solid var(--border)",
+                    }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+                            <FileText size={16} style={{ color: "var(--text-muted)", flexShrink: 0 }} />
+                            <div style={{ minWidth: 0 }}>
+                                <div style={{ fontSize: 13, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                    {s.display_name}
+                                </div>
+                                <div style={{ fontSize: 11, color: "var(--text-muted)" }}>{s.original_filename}</div>
+                            </div>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <span style={{
+                                padding: "2px 8px", borderRadius: 9999, fontSize: 11, fontWeight: 500,
+                                background: "var(--status-info-pill-bg)", color: "var(--status-info-pill-fg)",
+                            }}>Book {s.book_number}</span>
+                            <StatusChip status={s.status} />
+                            {s.status === "pending" && (
+                                <button onClick={() => deleteSource(s.source_id)} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", padding: 2 }}>
+                                    <Trash2 size={13} />
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                ))}
+
+                {/* Start / Resume buttons */}
+                <div style={{ marginTop: 16, display: "flex", gap: 8 }}>
+                    {ingesting ? (
+                        <button
+                            onClick={abortIngestion}
+                            disabled={isAborting}
+                            style={{
+                                ...btnStyle,
+                                background: "var(--status-error-bg)",
+                                color: "var(--status-error-fg)",
+                                flex: 1,
+                                opacity: isAborting ? 0.7 : 1,
+                                cursor: isAborting ? "not-allowed" : "pointer",
+                            }}
+                        >
+                            {isAborting ? "Aborting..." : "Abort"}
+                        </button>
+                    ) : showResume ? (
+                        <>
+                            <button onClick={() => startIngestion(true)} style={{ ...btnStyle, background: "var(--success)", color: "var(--primary-contrast)", flex: 1 }}>
+                                Resume
+                            </button>
+                            <button onClick={() => { if(confirm("This will erase all graph and vector data for this world, then rebuild it using the currently shown world settings. Are you sure?")) startIngestion(false); }} style={{ ...btnStyle, background: "var(--status-error-bg)", color: "var(--status-error-fg)", flex: 1 }}>
+                                Start Over
+                            </button>
+                        </>
+                    ) : showCompletedIdleState ? (
+                        <div style={{
+                            flex: 1,
+                            padding: "12px 14px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(34,197,94,0.28)",
+                            background: "rgba(34,197,94,0.08)",
+                            color: "#86efac",
+                            fontSize: 13,
+                            fontWeight: 600,
+                            textAlign: "center",
+                        }}>
+                            Ingestion complete for this world.
+                        </div>
+                    ) : (
+                        <button
+                            onClick={() => { startIngestion(false); }}
+                            disabled={!hasPending}
+                            style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)", flex: 1, opacity: !hasPending ? 0.4 : 1 }}
+                        >
+                            <Play size={14} /> Start Ingestion
+                        </button>
+                    )}
+                </div>
+
+                {showRechunkAction && (
+                    <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                        <div style={{ fontSize: 12, color: "var(--status-progress-fg)", lineHeight: 1.5 }}>
+                            {chunkSettingsChanged
+                                ? "Chunk size or overlap changed. This full rebuild will re-chunk, re-extract, rebuild the graph, and re-embed everything for this world."
+                                : "This full rebuild re-chunks, re-extracts, rebuilds the graph, and re-embeds everything for this world using the current ingest settings."}
+                        </div>
+                        <button
+                            onClick={() => {
+                                if (!confirm("This will clear this world's graph and vectors, then re-chunk, re-extract, rebuild the graph, and re-embed everything for this world. Chats and other non-ingest data stay intact. Continue?")) return;
+                                startIngestion(false, "rechunk_reingest");
+                            }}
+                            style={{ ...btnStyle, background: "var(--status-progress-bg)", color: "var(--primary-contrast)", width: "100%" }}
+                        >
+                            Rechunk And Re-ingest
+                        </button>
+                    </div>
+                )}
+
+                {showReembedAction && (
+                    <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                        <div style={{ fontSize: 12, color: "var(--status-info-pill-fg)", lineHeight: 1.5 }}>
+                            {embeddingModelChanged
+                                ? "Embedding model changed. This rebuild clears and re-creates all chunk and node vectors for the world without re-extracting or rebuilding the graph."
+                                : "This rebuild clears and re-creates all chunk and node vectors for the world without re-extracting or rebuilding the graph."}
+                        </div>
+                        <button
+                            onClick={() => {
+                                if (!confirm("This will clear this world's chunk and node vectors and re-embed all stored world content without re-extracting or rebuilding the graph. Chats and other non-ingest data stay intact. Continue?")) return;
+                                startIngestion(false, "reembed_all");
+                            }}
+                            style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)", width: "100%" }}
+                        >
+                            Re-embed All
+                        </button>
+                    </div>
+                )}
+
+                {!ingesting && failureRecords.length > 0 && (
+                    <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
+                        <button onClick={() => retryFailures("embedding")} style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)", width: "100%" }}>
+                            Retry Embedding Failures
+                        </button>
+                        <button onClick={() => retryFailures("extraction")} style={{ ...btnStyle, background: "var(--status-progress-bg)", color: "var(--primary-contrast)", width: "100%" }}>
+                            Retry Extraction Failures
+                        </button>
+                        <button onClick={() => retryFailures("all")} style={{ ...btnStyle, background: "var(--background-tertiary)", color: "var(--text-primary)", width: "100%" }}>
+                            Retry All Failures
+                        </button>
+                    </div>
+                )}
+
+                {hasPendingWorldSettingChange && !ingesting && (
+                    <div style={{
+                        marginTop: 10,
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        background: "rgba(251,191,36,0.08)",
+                        border: "1px solid rgba(251,191,36,0.25)",
+                        fontSize: 12,
+                        color: "#fcd34d",
+                        lineHeight: 1.5,
+                    }}>
+                        Retry buttons only fix failures in the currently locked ingest. Use the rebuild actions above to intentionally apply new chunk settings or a new embedding model.
+                    </div>
+                )}
+
+                <EntityResolutionPanel
+                    worldId={worldId}
+                    canResolve={canResolveEntities}
+                    allComplete={allComplete}
+                    isIngesting={ingesting}
+                />
+
+                {/* Resumable checkpoint info */}
+                {showResume && (
+                    <div style={{
+                        marginTop: 12, padding: "10px 12px", background: "var(--status-warning-soft-bg)", border: "1px solid var(--status-warning-soft-border)",
+                        borderRadius: 8, fontSize: 13, color: "var(--status-progress-fg)",
+                    }}>
+                        Resumable: {checkpoint?.chunk_index ?? 0}/{checkpoint?.chunks_total ?? 0} chunks complete
+                    </div>
+                )}
+
+                {stageCounters && (
+                    <div style={{
+                        marginTop: 12,
+                        border: "1px solid var(--border)",
+                        borderRadius: 8,
+                        padding: 10,
+                        background: "var(--background)",
+                        fontSize: 12,
+                        color: "var(--text-subtle)",
+                        display: "grid",
+                        gap: 4,
+                    }}>
+                        <div><strong style={{ color: "var(--text-primary)" }}>Expected:</strong> {stageCounters.expected_chunks}</div>
+                        <div><strong style={{ color: "var(--text-primary)" }}>Extracted:</strong> {stageCounters.extracted_chunks}</div>
+                        <div><strong style={{ color: "var(--text-primary)" }}>Embedded:</strong> {stageCounters.embedded_chunks}</div>
+                        <div><strong style={{ color: "var(--text-primary)" }}>Failed Records:</strong> {stageCounters.failed_records}</div>
+                    </div>
+                )}
+
+                {failureRecords.length > 0 && (
+                    <div style={{
+                        marginTop: 12,
+                        border: "1px solid var(--border)",
+                        borderRadius: 8,
+                        maxHeight: 220,
+                        overflowY: "auto",
+                        background: "var(--background)",
+                    }}>
+                        {failureRecords.map((failure, idx) => (
+                            <div key={`side-${failure.chunk_id}-${failure.stage}-${idx}`} style={{
+                                padding: "8px 10px",
+                                borderBottom: idx === failureRecords.length - 1 ? "none" : "1px solid var(--border)",
+                                fontSize: 12,
+                                display: "grid",
+                                gap: 3,
+                            }}>
+                                <div style={{ color: "var(--text-primary)", fontWeight: 600 }}>
+                                    {failure.stage.toUpperCase()} • B{failure.book_number}:C{failure.chunk_index}
+                                </div>
+                                <div style={{ color: "var(--text-subtle)" }}>
+                                    {failure.error_type}: {failure.error_message}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {/* Collapsible Ingestion Settings */}
+                <CollapsibleSection title="Ingestion Settings" open={showSettings} onToggle={() => setShowSettings(!showSettings)}>
+                    <div style={{
+                        marginBottom: 12,
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        background: "rgba(59,130,246,0.08)",
+                        border: "1px solid rgba(59,130,246,0.2)",
+                        fontSize: 12,
+                        color: "#bfdbfe",
+                        lineHeight: 1.5,
+                    }}>
+                        {savedIngestSettings?.locked_at
+                            ? `Locked for this world since ${new Date(savedIngestSettings.locked_at).toLocaleString()}. Changing chunk settings requires a full Rechunk And Re-ingest. Changing only the embedding model uses Re-embed All to rebuild chunk and node vectors without re-extracting.`
+                            : "This world has not locked ingest settings yet. The values below will be locked on the first full ingest."}
+                    </div>
+                    <div style={{ marginBottom: 12 }}>
+                        <label style={{ fontSize: 12, color: "var(--text-subtle)", marginBottom: 4, display: "block" }}>Chunk Size (chars)</label>
+                        <input type="number" value={chunkSize} onChange={(e) => setChunkSize(Number(e.target.value))} style={{ width: "100%" }} />
+                    </div>
+                    <div style={{ marginBottom: 12 }}>
+                        <label style={{ fontSize: 12, color: "var(--text-subtle)", marginBottom: 4, display: "block" }}>Chunk Overlap (chars)</label>
+                        <input type="number" value={chunkOverlap} onChange={(e) => setChunkOverlap(Number(e.target.value))} style={{ width: "100%" }} />
+                    </div>
+                    <div style={{ marginBottom: 12 }}>
+                        <label style={{ fontSize: 12, color: "var(--text-subtle)", marginBottom: 4, display: "block" }}>World Embedding Model</label>
+                        <input value={embeddingModel} onChange={(e) => setEmbeddingModel(e.target.value)} style={{ width: "100%", fontFamily: "monospace", fontSize: 13 }} />
+                    </div>
+                    <div style={{ marginBottom: 16 }}>
+                        <label style={{ fontSize: 12, color: "var(--text-subtle)", marginBottom: 4, display: "block" }}>Graph Architect Glean Amount (iterations)</label>
+                        <input type="number" min="0" max="5" value={gleanAmount} onChange={(e) => setGleanAmount(Number(e.target.value))} style={{ width: "100%" }} />
+                    </div>
+                    <button onClick={saveAgentSettings} style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)", width: "100%" }}>
+                        Save Graph Architect Settings
+                    </button>
+                </CollapsibleSection>
+
+                {/* Collapsible Prompt Editor */}
+                <CollapsibleSection title="Prompt Editor" open={showPrompts} onToggle={() => setShowPrompts(!showPrompts)}>
+                    {[
+                        "graph_architect_prompt",
+                        "entity_resolution_chooser_prompt",
+                        "entity_resolution_combiner_prompt",
+                    ].map((key) => (
+                        <PromptField
+                            key={`${key}:${prompts[key]?.source || "default"}:${prompts[key]?.value || ""}`}
+                            label={key.replace(/_prompt$/, "").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}
+                            promptKey={key}
+                            prompt={prompts[key]}
+                            onSave={savePrompt}
+                            onReset={resetPrompt}
+                        />
+                    ))}
+                </CollapsibleSection>
+            </div>
+
+            {/* Right Panel — Progress */}
+            <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+                {!ingesting && logEntries.length === 0 ? (
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", color: "var(--text-muted)" }}>
+                        <Upload size={48} style={{ marginBottom: 16, opacity: 0.3 }} />
+                        <p style={{ fontSize: 16 }}>
+                            {hasRetryableFailures
+                                ? "This world has retryable ingest failures."
+                                : hasAnyIngested
+                                    ? "Ingestion complete for this world."
+                                    : "Start ingestion to see progress."}
+                        </p>
+                        {(hasAnyIngested || hasRetryableFailures) && (
+                            <p style={{ fontSize: 13, marginTop: 6 }}>
+                                Retry failures or use Re-embed All / Rechunk And Re-ingest from the left panel.
+                            </p>
+                        )}
+                    </div>
+                ) : (
+                    <>
+                        {hasProgress && (
+                            <>
+                                {/* Progress bar */}
+                                <div style={{ marginBottom: 24 }}>
+                                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                                        <span style={{ fontSize: 14, fontWeight: 600 }}>
+                                            {progressLabel} {progress.completed} of {progress.total}
+                                        </span>
+                                        <span style={{ fontSize: 13, color: "var(--text-subtle)" }}>
+                                            {Math.round(progress.percent)}%
+                                        </span>
+                                    </div>
+                                    <div style={{ height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
+                                        <div style={{
+                                            height: "100%",
+                                            width: `${progress.percent}%`,
+                                            background: "linear-gradient(90deg, var(--primary), var(--primary-light))",
+                                            borderRadius: 3,
+                                            transition: "width 0.3s ease",
+                                        }} />
+                                    </div>
+                                </div>
+
+                                {/* Agent Pipeline */}
+                                <div style={{ display: "flex", gap: 12, marginBottom: 24 }}>
+                                    {progressStages.map((stage) => {
+                                        const currentStageIndex = progressStages.findIndex((entry) => entry.matches.includes(progress.agent));
+                                        const stageIndex = progressStages.findIndex((entry) => entry.key === stage.key);
+                                        const isActive = stage.matches.includes(progress.agent);
+                                        const isDone = currentStageIndex > stageIndex;
+                                        return (
+                                            <div key={stage.key} style={{
+                                                flex: 1, padding: "12px 16px", borderRadius: "var(--radius)",
+                                                border: `2px solid ${isActive ? "var(--primary)" : isDone ? "var(--success)" : "var(--border)"}`,
+                                                background: isActive ? "var(--primary-soft)" : "transparent",
+                                                textAlign: "center",
+                                                animation: isActive ? "pulse-glow 2s infinite" : "none",
+                                            }}>
+                                                <div style={{ fontSize: 12, fontWeight: 600, color: isActive ? "var(--primary-light)" : isDone ? "var(--success)" : "var(--text-subtle)" }}>
+                                                    {isDone && <CheckCircle size={14} style={{ marginRight: 4, verticalAlign: "middle" }} />}
+                                                    {isActive && <Loader2 size={14} style={{ marginRight: 4, verticalAlign: "middle", animation: "spin 1s linear infinite" }} />}
+                                                    {stage.label}
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </>
+                        )}
+
+                        {failureRecords.length > 0 && (
+                            <div style={{ marginBottom: 24 }}>
+                                <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>Failure Details</div>
+                                <div style={{
+                                    maxHeight: 220,
+                                    overflowY: "auto",
+                                    background: "var(--background)",
+                                    border: "1px solid var(--border)",
+                                    borderRadius: "var(--radius)",
+                                }}>
+                                    {failureRecords.map((failure, idx) => (
+                                        <div key={`${failure.chunk_id}-${failure.stage}-${idx}`} style={{
+                                            padding: "10px 12px",
+                                            borderBottom: idx === failureRecords.length - 1 ? "none" : "1px solid var(--border)",
+                                            fontSize: 12,
+                                            display: "grid",
+                                            gap: 4,
+                                        }}>
+                                            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                                                <strong style={{ color: "var(--text-primary)" }}>
+                                                    {failure.display_name || failure.source_id} • B{failure.book_number}:C{failure.chunk_index}
+                                                </strong>
+                                                <span style={{
+                                                    fontSize: 11,
+                                                    padding: "1px 8px",
+                                                    borderRadius: 9999,
+                                                    background: failure.stage === "embedding" ? "var(--status-embedding-pill-bg)" : "var(--status-extraction-pill-bg)",
+                                                    color: "var(--text-primary)",
+                                                    textTransform: "uppercase",
+                                                }}>
+                                                    {failure.stage}
+                                                </span>
+                                            </div>
+                                            <div style={{ color: "var(--text-subtle)" }}>
+                                                {failure.error_type}: {failure.error_message}
+                                            </div>
+                                            <div style={{ color: "var(--text-muted)" }}>
+                                                Attempts: {failure.attempt_count}
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Log */}
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                            <span style={{ fontSize: 14, fontWeight: 600 }}>Agent Log</span>
+                            <button onClick={() => setShowLog(!showLog)} style={{ background: "none", border: "none", color: "var(--text-subtle)", cursor: "pointer", fontSize: 13 }}>
+                                {showLog ? "Hide Log" : "Show Log"}
+                            </button>
+                        </div>
+                        {showLog && (
+                            <div style={{ maxHeight: 400, overflowY: "auto", background: "var(--background)", borderRadius: "var(--radius)", border: "1px solid var(--border)", padding: 12 }}>
+                                {logEntries.map((entry, i) => (
+                                    <LogEntryRow key={i} entry={entry} onViewBlocked={() => entry.chunk_text && setBlockedChunkData({ text: entry.chunk_text, reason: entry.safety_reason || "" })} />
+                                ))}
+                                <div ref={logEndRef} />
+                            </div>
+                        )}
+
+                        {/* Blocked Chunk Modal */}
+                        {blockedChunkData && (
+                            <div style={{
+                                position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+                                background: "var(--overlay-strong)", zIndex: 1000,
+                                display: "flex", alignItems: "center", justifyContent: "center", padding: 40
+                            }}>
+                                <div style={{
+                                    background: "var(--background)", border: "1px solid var(--border)",
+                                    borderRadius: "var(--radius)", width: "100%", maxWidth: 800,
+                                    maxHeight: "90vh", display: "flex", flexDirection: "column",
+                                    boxShadow: "0 20px 25px -5px var(--shadow-color)"
+                                }}>
+                                    <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                        <h3 style={{ fontSize: 16, fontWeight: 700, color: "var(--error)" }}>Safety Block Details</h3>
+                                        <button onClick={() => setBlockedChunkData(null)} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}>
+                                            <XCircle size={20} />
+                                        </button>
+                                    </div>
+                                    <div style={{ padding: 20, overflowY: "auto", flex: 1 }}>
+                                        <div style={{ marginBottom: 16, padding: 12, background: "var(--status-error-soft-bg)", borderRadius: 8, border: "1px solid var(--status-error-soft-border)" }}>
+                                            <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-subtle)", marginBottom: 4 }}>REASON</div>
+                                            <div style={{ fontSize: 14 }}>{blockedChunkData.reason}</div>
+                                        </div>
+                                        <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-subtle)", marginBottom: 8 }}>CHUNK CONTENT</div>
+                                        <div style={{
+                                            fontSize: 13, background: "var(--background-secondary)",
+                                            padding: 16, borderRadius: 8, border: "1px solid var(--border)",
+                                            fontFamily: "monospace", whiteSpace: "pre-wrap", overflowX: "auto"
+                                        }}>
+                                            {blockedChunkData.text}
+                                        </div>
+                                    </div>
+                                    <div style={{ padding: "16px 20px", borderTop: "1px solid var(--border)", display: "flex", justifyContent: "flex-end", gap: 12 }}>
+                                        <button
+                                            onClick={() => {
+                                                navigator.clipboard.writeText(blockedChunkData.text);
+                                                alert("Copied to clipboard!");
+                                            }}
+                                            style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)" }}
+                                        >
+                                            Copy Content
+                                        </button>
+                                        <button onClick={() => setBlockedChunkData(null)} style={{ ...btnStyle, background: "var(--border)", color: "var(--text-primary)" }}>
+                                            Close
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function StatusChip({ status }: { status: string }) {
+    const colors: Record<string, { bg: string; fg: string }> = {
+        pending: { bg: "var(--status-pending-bg)", fg: "var(--status-pending-fg)" },
+        ingesting: { bg: "var(--status-progress-bg)", fg: "var(--status-progress-fg)" },
+        complete: { bg: "var(--status-success-bg)", fg: "var(--status-success-fg)" },
+        partial_failure: { bg: "var(--status-error-bg)", fg: "var(--status-error-fg)" },
+        error: { bg: "var(--status-error-bg)", fg: "var(--status-error-fg)" },
+    };
+    const c = colors[status] || colors.pending;
+    return (
+        <span style={{ padding: "2px 8px", borderRadius: 9999, fontSize: 11, fontWeight: 500, background: c.bg, color: c.fg }}>
+            {status}
+        </span>
+    );
+}
+
+function LogEntryRow({ entry, onViewBlocked }: { entry: LogEntry, onViewBlocked: () => void }) {
+    const isStatusEvent = entry.event === "status";
+    const isError = entry.event === "error" || entry.error_type || entry.ingestion_status === "error";
+    const isComplete = (entry.event === "complete" && entry.status !== "partial_failure") || (isStatusEvent && entry.ingestion_status === "complete");
+    const isPartialComplete = (entry.event === "complete" && entry.status === "partial_failure") || (isStatusEvent && entry.ingestion_status === "partial_failure");
+    const isAgentDone = entry.event === "agent_complete";
+    const isAborting = entry.event === "aborting";
+
+    return (
+        <div style={{
+            padding: "6px 0",
+            borderBottom: "1px solid var(--border)",
+            fontSize: 13,
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            color: isError ? "var(--error)" : isComplete ? "var(--success)" : isPartialComplete ? "var(--status-progress-fg)" : "var(--text-primary)",
+        }}>
+            {isError && <XCircle size={13} style={{ flexShrink: 0 }} />}
+            {isComplete && <CheckCircle size={13} style={{ flexShrink: 0 }} />}
+            {isPartialComplete && <CheckCircle size={13} style={{ flexShrink: 0, color: "var(--status-progress-fg)" }} />}
+            {isAgentDone && <CheckCircle size={13} style={{ flexShrink: 0, color: "var(--success)" }} />}
+            {!isError && !isComplete && !isPartialComplete && !isAgentDone && <Loader2 size={13} style={{ flexShrink: 0, color: "var(--text-muted)" }} />}
+
+            {entry.book_number !== undefined && entry.chunk_index !== undefined && (
+                <span style={{ padding: "1px 6px", borderRadius: 4, background: "var(--status-info-pill-bg)", color: "var(--status-info-pill-fg)", fontSize: 11, fontFamily: "monospace" }}>
+                    B{entry.book_number}:C{entry.chunk_index}
+                </span>
+            )}
+
+            <span style={{ flex: 1 }}>
+                {entry.event === "progress" && `Processing — ${entry.active_agent?.replace(/_/g, " ")}`}
+                {entry.event === "agent_complete" && (
+                    <>
+                        {entry.agent?.replace(/_/g, " ")} done
+                        <span style={{ marginLeft: 6, opacity: 0.7 }}>
+                            ({[
+                                entry.node_count !== undefined && `${entry.node_count} nodes`,
+                                entry.edge_count !== undefined && `${entry.edge_count} relationships`,
+                                entry.claim_count !== undefined && `${entry.claim_count} claims`,
+                                entry.chunk_vector_count !== undefined && `${entry.chunk_vector_count} chunk vectors`,
+                                entry.node_vector_count !== undefined && `${entry.node_vector_count} node vectors`,
+                            ].filter(Boolean).join(", ")})
+                        </span>
+                    </>
+                )}
+                {entry.event === "error" && (
+                    <>
+                        {entry.agent?.replace(/_/g, " ") || "Error"}: {entry.message || entry.error_type}
+                        {entry.error_type === "safety_block" && entry.chunk_text && (
+                            <button
+                                onClick={(e) => { e.stopPropagation(); onViewBlocked(); }}
+                                style={{
+                                    marginLeft: 12, padding: "2px 8px", fontSize: 11, background: "var(--error)",
+                                    color: "var(--primary-contrast)", border: "none", borderRadius: 4, cursor: "pointer", fontWeight: 600
+                                }}
+                            >
+                                View Blocked Chunk
+                            </button>
+                        )}
+                    </>
+                )}
+                {entry.event === "complete" && entry.status === "partial_failure" && "Retry finished. Some failures remain."}
+                {entry.event === "complete" && entry.status !== "partial_failure" && "Ingestion complete!"}
+                {entry.event === "status" && entry.ingestion_status === "complete" && "Ingestion complete!"}
+                {entry.event === "status" && entry.ingestion_status === "partial_failure" && "Retry finished. Some failures remain."}
+                {entry.event === "status" && entry.ingestion_status === "error" && "Ingestion failed."}
+                {isAborting && "Aborting... waiting for in-flight work to stop."}
+                {entry.event === "aborted" && `Ingestion aborted`}
+            </span>
+        </div>
+    );
+}
+
+function CollapsibleSection({ title, open, onToggle, children }: { title: string; open: boolean; onToggle: () => void; children: React.ReactNode }) {
+    return (
+        <div style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+            <button
+                onClick={onToggle}
+                style={{
+                    width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center",
+                    background: "none", border: "none", color: "var(--text-subtle)", cursor: "pointer",
+                    fontSize: 13, fontWeight: 600, padding: "4px 0", textTransform: "uppercase", letterSpacing: "0.05em",
+                }}
+            >
+                {title}
+                {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            </button>
+            {open && <div style={{ marginTop: 12 }}>{children}</div>}
+        </div>
+    );
+}
+
+function PromptField({ label, promptKey, prompt, onSave, onReset }: {
+    label: string;
+    promptKey: string;
+    prompt?: { value: string; source: string };
+    onSave: (key: string, value: string) => void;
+    onReset: (key: string) => void;
+}) {
+    const [value, setValue] = useState(prompt?.value || "");
+
+    return (
+        <div style={{ marginBottom: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>{label}</span>
+                <span style={{
+                    fontSize: 11, padding: "2px 8px", borderRadius: 9999, fontWeight: 500,
+                    background: prompt?.source === "custom" ? "var(--primary-soft-strong)" : "var(--status-pending-bg)",
+                    color: prompt?.source === "custom" ? "var(--primary-light)" : "var(--status-pending-fg)",
+                }}>
+                    {prompt?.source || "default"}
+                </span>
+            </div>
+            <textarea
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                rows={4}
+                style={{ width: "100%", minHeight: 120, resize: "vertical", fontSize: 12 }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                <button onClick={() => onSave(promptKey, value)} style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)", flex: 1, fontSize: 12 }}>
+                    Save
+                </button>
+                <button onClick={() => onReset(promptKey)} style={{ ...btnStyle, background: "var(--border)", color: "var(--text-subtle)", flex: 1, fontSize: 12 }}>
+                    Reset to Default
+                </button>
+            </div>
+        </div>
+    );
+}
+
+const btnStyle: React.CSSProperties = {
+    display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6,
+    padding: "8px 16px", borderRadius: "var(--radius)", border: "none",
+    fontSize: 13, fontWeight: 600, cursor: "pointer", transition: "opacity 0.2s",
+};

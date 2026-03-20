@@ -1,0 +1,45 @@
+# Repo-wide local state
+settings/settings.json
+settings/settings.json.tmp
+saved_worlds/
+backend/saved_worlds/
+Corpus/
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.local.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env.local
+frontend/.env.*
+!frontend/.env.local.example
+
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+backend/venv/
+backend/.pytest-tmp/
+backend/pytest-basetemp*/
+backend/pytest-cache-files-*/
+backend/tmp*/
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/*.tsbuildinfo
+
+# Dumps and local scratch files
+backend/Get back end nodes template/
+backend/smoke_settings_tmp/
+backend/tmp_test_safety.py
+backend/0.27
+AGENTS.md
+*.log
+*.tmp

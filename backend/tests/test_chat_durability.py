@@ -1,0 +1,140 @@
+import asyncio
+import json
+from pathlib import Path
+import shutil
+import uuid
+
+import pytest
+from fastapi import HTTPException
+
+from core import chat_store
+from routers import chat as chat_router
+
+
+def _make_store(monkeypatch, world_id: str) -> chat_store.ChatStore:
+    world_root = chat_store.world_dir(world_id)
+    if world_root.exists():
+        shutil.rmtree(world_root)
+    world_root.mkdir(parents=True, exist_ok=True)
+
+    meta_path = world_root / "world_meta.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(chat_router, "world_meta_path", lambda wid: meta_path)
+    return chat_store.ChatStore(world_id)
+
+
+async def _consume_stream(response) -> list[str]:
+    chunks: list[str] = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+    return chunks
+
+
+async def _read_one_and_close(response) -> str:
+    iterator = response.body_iterator
+    first = await iterator.__anext__()
+    await iterator.aclose()
+    return first.decode("utf-8") if isinstance(first, bytes) else first
+
+
+def _parse_sse(chunks: list[str]) -> list[dict]:
+    events = []
+    for chunk in chunks:
+        if chunk.startswith("data: "):
+            events.append(json.loads(chunk[6:].strip()))
+    return events
+
+
+def test_update_history_rejects_stale_base_version(monkeypatch):
+    world_id = f"world-{uuid.uuid4()}"
+    store = _make_store(monkeypatch, world_id)
+    created = store.create_chat("Durable")
+
+    result = asyncio.run(chat_router.update_chat_history(
+        world_id,
+        created["id"],
+        chat_router.UpdateChatHistoryRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            base_version=created["version"],
+        ),
+    ))
+
+    assert result["version"] == created["version"] + 1
+    assert result["messages"][0]["status"] == "complete"
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(chat_router.update_chat_history(
+            world_id,
+            created["id"],
+            chat_router.UpdateChatHistoryRequest(
+                messages=[{"role": "user", "content": "stale"}],
+                base_version=created["version"],
+            ),
+        ))
+
+    assert exc_info.value.status_code == 409
+
+
+def test_stream_reply_persists_placeholder_before_done_and_finishes_saved(monkeypatch):
+    world_id = f"world-{uuid.uuid4()}"
+    store = _make_store(monkeypatch, world_id)
+    created = store.create_chat("Durable")
+
+    def fake_stream_chat(*, world_id, message, history, settings_override=None):
+        yield f"data: {json.dumps({'token': 'hello'})}\n\n"
+        yield f"data: {json.dumps({'token': ' world'})}\n\n"
+        yield f"data: {json.dumps({'event': 'done', 'nodes_used': [{'id': 'n1'}], 'context_payload': {'messages': []}, 'context_meta': {'provider': 'test'}})}\n\n"
+
+    monkeypatch.setattr(chat_router, "stream_chat", fake_stream_chat)
+
+    response = asyncio.run(chat_router.stream_chat_message(
+        world_id,
+        created["id"],
+        chat_router.ChatRequest(message="Hi there"),
+    ))
+
+    seeded = store.get_chat(created["id"])
+    assert seeded is not None
+    assert seeded["version"] == created["version"] + 1
+    assert seeded["messages"][-2]["role"] == "user"
+    assert seeded["messages"][-2]["content"] == "Hi there"
+    assert seeded["messages"][-1]["role"] == "model"
+    assert seeded["messages"][-1]["status"] == "streaming"
+
+    chunks = asyncio.run(_consume_stream(response))
+    events = _parse_sse(chunks)
+    done_event = [event for event in events if event.get("event") == "done"][0]
+
+    saved = store.get_chat(created["id"])
+    assert saved is not None
+    assert saved["version"] == done_event["chat_version"]
+    assert saved["messages"][-1]["status"] == "complete"
+    assert saved["messages"][-1]["content"] == "hello world"
+    assert saved["messages"][-1]["context_meta"] == {"provider": "test"}
+
+
+def test_stream_disconnect_marks_model_turn_incomplete(monkeypatch):
+    world_id = f"world-{uuid.uuid4()}"
+    store = _make_store(monkeypatch, world_id)
+    created = store.create_chat("Durable")
+
+    def fake_stream_chat(*, world_id, message, history, settings_override=None):
+        yield f"data: {json.dumps({'token': 'partial'})}\n\n"
+        yield f"data: {json.dumps({'token': ' reply'})}\n\n"
+
+    monkeypatch.setattr(chat_router, "stream_chat", fake_stream_chat)
+
+    response = asyncio.run(chat_router.stream_chat_message(
+        world_id,
+        created["id"],
+        chat_router.ChatRequest(message="Hi there"),
+    ))
+
+    first_chunk = asyncio.run(_read_one_and_close(response))
+    assert "partial" in first_chunk
+
+    saved = store.get_chat(created["id"])
+    assert saved is not None
+    assert saved["messages"][-1]["status"] == "incomplete"
+    assert saved["messages"][-1]["content"] == "partial"
