@@ -147,7 +147,7 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
     // Settings state
     const [chunkSize, setChunkSize] = useState(4000);
     const [chunkOverlap, setChunkOverlap] = useState(150);
-    const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-002-preview");
+    const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-2-preview");
     const [savedIngestSettings, setSavedIngestSettings] = useState<IngestSettings | null>(null);
     const [gleanAmount, setGleanAmount] = useState(1);
     const [gleanAmountDraft, setGleanAmountDraft] = useState("1");

@@ -26,7 +26,7 @@ _DEFAULT_SETTINGS = {
     "default_model_chat": "gemini-flash-latest",
     "default_model_entity_chooser": "gemini-flash-latest",
     "default_model_entity_combiner": "gemini-flash-lite-latest",
-    "embedding_model": "gemini-embedding-002-preview",
+    "embedding_model": "gemini-embedding-2-preview",
     "chunk_size_chars": 4000,
     "chunk_overlap_chars": 150,
     "retrieval_top_k_chunks": 5,

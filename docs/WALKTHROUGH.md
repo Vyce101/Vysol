@@ -84,7 +84,7 @@ Entity Combiner Model:
 Default Embedding Model:
 
 - This is the default embedding model for new worlds
-- The shipped default is `gemini-embedding-002-preview`
+- The shipped default is `gemini-embedding-2-preview`
 
 Disable Safety Filters:
 
@@ -115,7 +115,7 @@ Shipped defaults:
 
 - Chunk size: `4000`
 - Chunk overlap: `150`
-- World embedding model: `gemini-embedding-002-preview`
+- World embedding model: `gemini-embedding-2-preview`
 - Graph Architect glean amount: `1`
 
 What they mean:

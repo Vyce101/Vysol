@@ -103,7 +103,7 @@ async def create_world(req: CreateWorldRequest):
         "total_chunks": 0,
         "total_nodes": 0,
         "total_edges": 0,
-        "embedding_model": settings.get("embedding_model", "gemini-embedding-002-preview"),
+        "embedding_model": settings.get("embedding_model", "gemini-embedding-2-preview"),
         "ingest_settings": {
             "locked_at": None,
             "last_ingest_settings_at": None,

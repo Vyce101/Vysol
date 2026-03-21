@@ -23,7 +23,7 @@ Default models (current):
 - Chat Model: `gemini-flash-latest`
 - Entity Chooser Model: `gemini-flash-latest`
 - Entity Combiner Model: `gemini-flash-lite-latest`
-- Default Embedding Model: `gemini-embedding-002-preview`
+- Default Embedding Model: `gemini-embedding-2-preview`
 
 Default chat settings (current):
 
