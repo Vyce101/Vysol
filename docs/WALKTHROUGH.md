@@ -8,12 +8,20 @@ Open the settings sidebar from the home screen before you ingest your first worl
 
 - Only Gemini API keys are supported in VySol's built-in key management flow
 - Click the `+` button to add each key
-- All saved keys participate in key rotation
+- Saved keys stay stored in Settings even when you toggle them off
+- Only active saved keys participate in key rotation
+- If every saved key is inactive, VySol can still fall back to `GEMINI_API_KEY` from your local environment
 
 Key Rotation Mode:
 
 - `Fail Over`: keeps using the current key until it hits a rate limit, then moves to the next one
 - `Round Robin`: rotates across keys to spread load more evenly
+
+Per-key toggle behavior:
+
+- `ON` means the key is active and eligible for rotation
+- `OFF` means the key stays saved on disk but is skipped by `Fail Over` and `Round Robin`
+- The Settings sidebar shows how many keys are active versus how many are stored
 
 Need help getting a Google AI Studio key?
 

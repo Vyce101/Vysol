@@ -27,6 +27,12 @@ Notes:
 
 If you use multiple keys, VySol can rotate them using `Fail Over` or `Round Robin`.
 
+You can also toggle individual saved keys `ON` or `OFF` in Settings:
+
+- `ON` keys are active and used by rotation
+- `OFF` keys stay saved locally but are skipped
+- This is useful when you want to keep a key around without deleting it
+
 ## Basic Key Safety Rules
 
 - Never commit live keys to git
