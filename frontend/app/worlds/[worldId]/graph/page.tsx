@@ -9,6 +9,7 @@ const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), { ssr: false 
 
 type ForceGraphHandle = {
     zoomToFit: (ms?: number, padding?: number) => void;
+    getGraphBbox: () => { x: [number, number]; y: [number, number] } | undefined;
     d3Force: (forceName: string) => {
         strength?: (value: number | ((obj: unknown) => number)) => void;
         distance?: (value: number | ((obj: unknown) => number)) => void;
@@ -54,6 +55,26 @@ const readThemeVar = (name: string, fallback: string) => {
     return value || fallback;
 };
 
+const escapeHtml = (value: string) =>
+    value
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+
+const hasUsableGraphBounds = (bbox: { x: [number, number]; y: [number, number] } | undefined) => {
+    if (!bbox) return false;
+
+    const [minX, maxX] = bbox.x;
+    const [minY, maxY] = bbox.y;
+    if (![minX, maxX, minY, maxY].every((value) => Number.isFinite(value))) {
+        return false;
+    }
+
+    return maxX > minX && maxY > minY;
+};
+
 interface NodeDetail {
     id: string;
     display_name: string;
@@ -82,9 +103,12 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
     const graphRef = useRef<ForceGraphHandle | null>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const resizeFrameRef = useRef<number | null>(null);
+    const initialFitFrameRef = useRef<number | null>(null);
+    const hasInitialFitRunRef = useRef(false);
 
     const loadGraph = useCallback(async () => {
         try {
+            hasInitialFitRunRef.current = false;
             const data = await apiFetch<{ nodes: GraphNode[]; edges: GraphLink[] }>(`/worlds/${worldId}/graph`);
             setNodes(data.nodes);
             setEdges(data.edges);
@@ -138,6 +162,10 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
                 window.cancelAnimationFrame(resizeFrameRef.current);
                 resizeFrameRef.current = null;
             }
+            if (initialFitFrameRef.current !== null) {
+                window.cancelAnimationFrame(initialFitFrameRef.current);
+                initialFitFrameRef.current = null;
+            }
         };
     }, [scheduleMeasurement, nodes.length]);
 
@@ -171,17 +199,8 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
         }
     };
 
-    useEffect(() => {
-        if (!nodes.length || dimensions.width <= 0 || dimensions.height <= 0) return;
-        const timer = window.setTimeout(() => {
-            graphRef.current?.zoomToFit(400, 40);
-        }, 80);
-        return () => window.clearTimeout(timer);
-    }, [nodes.length, dimensions.width, dimensions.height]);
-
-    useEffect(() => {
-        if (!graphRef.current || nodes.length === 0) return;
-
+    const applyGraphLayout = useCallback(() => {
+        if (!graphRef.current || nodes.length === 0 || dimensions.width <= 0 || dimensions.height <= 0) return false;
         const getLinkedNode = (value: string | RenderNode) =>
             typeof value === "object" ? value : nodes.find((node) => node.id === value);
 
@@ -202,7 +221,8 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
         linkForce?.strength?.(0.07);
 
         graphRef.current.d3ReheatSimulation();
-    }, [nodes, edges]);
+        return true;
+    }, [dimensions.height, dimensions.width, nodes]);
 
     const getSourceColor = (sourceStr?: string | number) => {
         if (!sourceStr) return readThemeVar("--graph-node", "#7c3aed");
@@ -221,6 +241,70 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
         const hue = (bookNum * 137.5) % 360; // Golden angle for distribution
         return `hsl(${hue}, 70%, 60%)`;
     };
+
+    const getNodeLabel = useCallback((value: string | RenderNode) => {
+        if (typeof value === "object" && value !== null) {
+            return value.label || value.id || "Unknown";
+        }
+
+        const matchedNode = nodes.find((node) => node.id === value);
+        return matchedNode?.label || value || "Unknown";
+    }, [nodes]);
+
+    const getEdgeTemporalLabel = useCallback((link: GraphLink) => {
+        if (typeof link.source_book === "number" && typeof link.source_chunk === "number" && link.source_book > 0 && link.source_chunk > 0) {
+            return `Book ${link.source_book} > Chunk ${link.source_chunk}`;
+        }
+        return "Unknown origin";
+    }, []);
+
+    useEffect(() => {
+        if (nodes.length === 0 || dimensions.width <= 0 || dimensions.height <= 0) {
+            return;
+        }
+
+        if (initialFitFrameRef.current !== null) {
+            window.cancelAnimationFrame(initialFitFrameRef.current);
+        }
+
+        let layoutApplied = false;
+        const waitForGraph = () => {
+            if (!graphRef.current) {
+                initialFitFrameRef.current = window.requestAnimationFrame(waitForGraph);
+                return;
+            }
+
+            if (!layoutApplied) {
+                layoutApplied = applyGraphLayout();
+            }
+
+            if (!layoutApplied) {
+                initialFitFrameRef.current = window.requestAnimationFrame(waitForGraph);
+                return;
+            }
+
+            if (!hasInitialFitRunRef.current) {
+                const bbox = graphRef.current.getGraphBbox();
+                if (!hasUsableGraphBounds(bbox)) {
+                    initialFitFrameRef.current = window.requestAnimationFrame(waitForGraph);
+                    return;
+                }
+
+                initialFitFrameRef.current = null;
+                graphRef.current.zoomToFit(400, 40);
+                hasInitialFitRunRef.current = true;
+            }
+        };
+
+        initialFitFrameRef.current = window.requestAnimationFrame(waitForGraph);
+
+        return () => {
+            if (initialFitFrameRef.current !== null) {
+                window.cancelAnimationFrame(initialFitFrameRef.current);
+                initialFitFrameRef.current = null;
+            }
+        };
+    }, [applyGraphLayout, dimensions.height, dimensions.width, nodes.length]);
 
     const nodeCanvasObject = useCallback(
         (node: RenderNode, ctx: CanvasRenderingContext2D) => {
@@ -282,6 +366,7 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
                     nodeCanvasObject={nodeCanvasObject}
                     d3AlphaDecay={0.02}
                     d3VelocityDecay={0.2}
+                    warmupTicks={100}
                     cooldownTicks={220}
                     linkDirectionalArrowLength={10}
                     linkDirectionalArrowRelPos={1}
@@ -339,17 +424,16 @@ export default function GraphPage({ params }: { params: Promise<{ worldId: strin
                         `;
                     }}
                     linkLabel={(link: RenderLink) => {
-                        const sourceInfo = link.source_book ? `Book ${link.source_book} › Chunk ${link.source_chunk}` : "Unknown";
-                        const createdAt = link.created_at ? new Date(link.created_at).toLocaleString() : "Unknown";
+                        const sourceName = escapeHtml(getNodeLabel(link.source));
+                        const targetName = escapeHtml(getNodeLabel(link.target));
+                        const description = escapeHtml((link.description || "").trim() || "No description available.");
+                        const temporalLabel = escapeHtml(getEdgeTemporalLabel(link));
                         return `
                             <div style="background: var(--tooltip-bg); padding: 12px; border: 1px solid var(--tooltip-border); border-radius: 8px; color: var(--tooltip-text); max-width: 300px; box-shadow: 0 4px 20px var(--shadow-color);">
-                                <div style="font-weight: 700; font-size: 13px; margin-bottom: 6px; border-bottom: 1px solid var(--tooltip-strong-border); padding-bottom: 4px; color: var(--text-subtle);">Relationship Details</div>
-                                <div style="font-size: 12px; line-height: 1.5; opacity: 0.9;">${link.description || "No description available."}</div>
-                                <div style="margin-top: 8px; font-size: 11px; color: var(--primary); font-weight: 600;">Strength: ${link.strength || 1}/10</div>
-                                <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--tooltip-border); font-size: 10px; color: var(--tooltip-subtle);">
-                                    <div><strong style="color: var(--text-subtle);">Source:</strong> ${sourceInfo}</div>
-                                    <div><strong style="color: var(--text-subtle);">Extracted:</strong> ${createdAt}</div>
-                                </div>
+                                <div style="font-size: 12px; line-height: 1.5; font-weight: 600; color: var(--text-subtle);">Source: ${sourceName}</div>
+                                <div style="margin-top: 6px; font-size: 12px; line-height: 1.5; opacity: 0.92;">${description}</div>
+                                <div style="margin-top: 6px; font-size: 11px; line-height: 1.5; color: var(--tooltip-subtle);">${temporalLabel}</div>
+                                <div style="margin-top: 6px; font-size: 12px; line-height: 1.5; font-weight: 600; color: var(--text-subtle);">Target: ${targetName}</div>
                             </div>
                         `;
                     }}

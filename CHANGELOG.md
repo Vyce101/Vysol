@@ -1,0 +1,35 @@
+# Changelog
+
+All notable user-visible changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Added
+
+- Initial GraphRAG backend and frontend with a resilient local launcher.
+- Split setup and usage docs into dedicated guides for setup, walkthrough, and features.
+- Added a dedicated system diagram page and linked it from the README.
+- Added branding assets and a README logo.
+- Added entity resolution run modes, including `Exact only` and `Exact + chooser/combiner`.
+- Added per-key Gemini API key toggles and a dedicated repo-local pytest temp folder.
+- Added the VySol browser/header branding icon using the square logo asset.
+
+### Changed
+
+- Refreshed docs and aligned runtime defaults.
+- Corrected project branding capitalization to `VySol`.
+- Documented entity resolution run modes.
+- Documented API key toggle behavior in the walkthrough and Google AI Studio key guide.
+- Renamed the default embedding model to `gemini-embedding-2-preview`.
+
+### Fixed
+
+- Fixed glean default/input behavior and clarified the currently supported OS.
+- Fixed launcher startup state detection.
+- Fixed Gemini chat payload assembly for the Gemini SDK request shape.
+- Fixed graph edge hover details to show source and target names plus provenance in the graph viewer.
+- Fixed graph viewer startup layout so first-open graphs spread correctly and auto-fit no longer hijacks manual navigation.
+
+### Removed
+
+- Removed obsolete frontend-local README/test-writing clutter that no longer belonged in the shipped project.
