@@ -16,6 +16,8 @@ import {
     startEntityResolution,
     streamEntityResolutionEvents,
     type EntityResolutionEvent,
+    type EntityResolutionMode,
+    type EntityResolutionRunMode,
     type EntityResolutionStatus,
 } from "@/lib/api";
 
@@ -96,6 +98,24 @@ function statusBadge(status?: string) {
     return { bg: "var(--background-tertiary)", fg: "var(--text-subtle)", label: "Idle" };
 }
 
+function isRequestResolutionMode(value: unknown): value is EntityResolutionMode {
+    return value === "exact_only" || value === "exact_then_ai";
+}
+
+function usesAiResolution(mode?: string) {
+    return mode !== "exact_only";
+}
+
+function formatResolutionMode(mode?: string) {
+    if (mode === "exact_only") {
+        return "Exact Only";
+    }
+    if (mode === "ai_only") {
+        return "Chooser/Combiner Only (Legacy)";
+    }
+    return "Exact + Chooser/Combiner";
+}
+
 export default function EntityResolutionPanel({
     worldId,
     canResolve,
@@ -104,8 +124,7 @@ export default function EntityResolutionPanel({
 }: EntityResolutionPanelProps) {
     const [open, setOpen] = useState(false);
     const [topK, setTopK] = useState(50);
-    const [reviewMode, setReviewMode] = useState(true);
-    const [includeNormalizedExactPass, setIncludeNormalizedExactPass] = useState(true);
+    const [resolutionMode, setResolutionMode] = useState<EntityResolutionMode>("exact_then_ai");
     const [status, setStatus] = useState<EntityResolutionStatus | null>(null);
     const [logs, setLogs] = useState<ResolutionLogRow[]>([]);
     const [running, setRunning] = useState(false);
@@ -129,6 +148,9 @@ export default function EntityResolutionPanel({
         setError(null);
         if (typeof next.top_k === "number") {
             setTopK(next.top_k);
+        }
+        if (isRequestResolutionMode(next.resolution_mode)) {
+            setResolutionMode(next.resolution_mode);
         }
     }
 
@@ -215,6 +237,8 @@ export default function EntityResolutionPanel({
     const triggerDisabled = !running && !canResolve;
     const badge = statusBadge(status?.status || (running ? "running" : "idle"));
     const displayedTopK = typeof status?.top_k === "number" ? status.top_k : topK;
+    const activeResolutionMode: EntityResolutionRunMode = (status?.resolution_mode as EntityResolutionRunMode | undefined) || resolutionMode;
+    const topKInUse = usesAiResolution(activeResolutionMode);
     const eventRows = [...logs].reverse();
 
     const handleStart = async () => {
@@ -223,8 +247,7 @@ export default function EntityResolutionPanel({
         try {
             await startEntityResolution(worldId, {
                 top_k: topK,
-                review_mode: reviewMode,
-                include_normalized_exact_pass: includeNormalizedExactPass,
+                resolution_mode: resolutionMode,
             });
             setOpen(true);
             await loadSnapshot(true);
@@ -325,7 +348,7 @@ export default function EntityResolutionPanel({
                                     </span>
                                 </div>
                                 <p style={{ fontSize: 13, color: "var(--text-muted)", maxWidth: 820, lineHeight: 1.5 }}>
-                                    First pass uses exact matching after normalization, then the resolver can review top-K embedding candidates and merge only entities. Temporal edges stay intact.
+                                    Run either an exact-only normalization pass or continue into chooser/combiner review after exact matches are merged. Temporal edges stay intact.
                                 </p>
                             </div>
                             <button
@@ -370,8 +393,8 @@ export default function EntityResolutionPanel({
                                     <div style={summaryValueStyle}>{formatTitle((status?.phase as string | undefined) || "waiting")}</div>
                                 </div>
                                 <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Top K</div>
-                                    <div style={summaryValueStyle}>{formatCount(displayedTopK)}</div>
+                                    <div style={summaryLabelStyle}>Mode</div>
+                                    <div style={summaryValueStyle}>{formatResolutionMode(activeResolutionMode)}</div>
                                 </div>
                                 <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
                                     <div style={summaryLabelStyle}>Resolved</div>
@@ -382,8 +405,8 @@ export default function EntityResolutionPanel({
                                     <div style={summaryValueStyle}>{formatCount(status?.unresolved_entities as number | undefined)}</div>
                                 </div>
                                 <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Exact pass</div>
-                                    <div style={summaryValueStyle}>{includeNormalizedExactPass ? "On" : "Off"}</div>
+                                    <div style={summaryLabelStyle}>Top K</div>
+                                    <div style={summaryValueStyle}>{topKInUse ? formatCount(displayedTopK) : "Not Used"}</div>
                                 </div>
                             </div>
 
@@ -447,6 +470,18 @@ export default function EntityResolutionPanel({
                                     }}
                                 >
                                     <label style={controlLabelStyle}>
+                                        <span style={controlTextStyle}>Resolution mode</span>
+                                        <select
+                                            value={resolutionMode}
+                                            onChange={(e) => setResolutionMode(e.target.value as EntityResolutionMode)}
+                                            disabled={busy || running}
+                                            style={controlInputStyle}
+                                        >
+                                            <option value="exact_only">Exact only</option>
+                                            <option value="exact_then_ai">Exact + chooser/combiner</option>
+                                        </select>
+                                    </label>
+                                    <label style={controlLabelStyle}>
                                         <span style={controlTextStyle}>Top K candidates</span>
                                         <input
                                             type="number"
@@ -454,27 +489,14 @@ export default function EntityResolutionPanel({
                                             max={250}
                                             value={topK}
                                             onChange={(e) => setTopK(Number(e.target.value) || 1)}
-                                            disabled={busy || running}
+                                            disabled={busy || running || resolutionMode === "exact_only"}
                                             style={controlInputStyle}
                                         />
-                                    </label>
-                                    <label style={controlLabelStyle}>
-                                        <span style={controlTextStyle}>Review mode</span>
-                                        <input
-                                            type="checkbox"
-                                            checked={reviewMode}
-                                            onChange={(e) => setReviewMode(e.target.checked)}
-                                            disabled={busy || running}
-                                        />
-                                    </label>
-                                    <label style={controlLabelStyle}>
-                                        <span style={controlTextStyle}>Include exact normalized pass</span>
-                                        <input
-                                            type="checkbox"
-                                            checked={includeNormalizedExactPass}
-                                            onChange={(e) => setIncludeNormalizedExactPass(e.target.checked)}
-                                            disabled={busy || running}
-                                        />
+                                        <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4 }}>
+                                            {resolutionMode === "exact_only"
+                                                ? "Exact-only runs skip candidate search, so Top K is not used."
+                                                : "Used for candidate search before chooser/combiner review."}
+                                        </span>
                                     </label>
                                 </div>
 

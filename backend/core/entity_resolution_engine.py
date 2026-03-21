@@ -9,7 +9,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from .agents import _call_agent
 from .config import load_settings, world_meta_path
@@ -27,9 +27,30 @@ _state_locks: dict[str, threading.Lock] = {}
 _active_runs: set[str] = set()
 _STALE_RUN_GRACE_SECONDS = 15
 
+EntityResolutionMode = Literal["exact_only", "exact_then_ai", "ai_only"]
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def resolve_entity_resolution_mode(
+    resolution_mode: str | None,
+    include_normalized_exact_pass: bool = True,
+) -> EntityResolutionMode:
+    if resolution_mode == "exact_only":
+        return "exact_only"
+    if resolution_mode == "exact_then_ai":
+        return "exact_then_ai"
+    return "exact_then_ai" if include_normalized_exact_pass else "ai_only"
+
+
+def _mode_uses_exact_pass(resolution_mode: EntityResolutionMode) -> bool:
+    return resolution_mode != "ai_only"
+
+
+def _mode_uses_ai_pass(resolution_mode: EntityResolutionMode) -> bool:
+    return resolution_mode != "exact_only"
 
 
 def _is_stale_in_progress(state: dict[str, Any]) -> bool:
@@ -125,6 +146,10 @@ def get_resolution_status(world_id: str) -> dict[str, Any]:
     if world_id not in _active_runs and _is_stale_in_progress(meta_like_state):
         return _mark_run_stale(world_id)
     settings = load_settings()
+    resolution_mode = resolve_entity_resolution_mode(
+        meta.get("entity_resolution_mode"),
+        meta.get("entity_resolution_exact_pass", True),
+    )
     return {
         "status": meta.get("entity_resolution_status", "idle"),
         "phase": meta.get("entity_resolution_phase"),
@@ -135,8 +160,9 @@ def get_resolution_status(world_id: str) -> dict[str, Any]:
         "unresolved_entities": meta.get("entity_resolution_unresolved_entities", 0),
         "auto_resolved_pairs": meta.get("entity_resolution_auto_resolved_pairs", 0),
         "total_entities": meta.get("entity_resolution_total_entities", 0),
+        "resolution_mode": resolution_mode,
         "review_mode": meta.get("entity_resolution_review_mode", False),
-        "include_normalized_exact_pass": meta.get("entity_resolution_exact_pass", True),
+        "include_normalized_exact_pass": _mode_uses_exact_pass(resolution_mode),
         "can_resume": False,
     }
 
@@ -158,6 +184,7 @@ def begin_entity_resolution_run(
     top_k: int,
     review_mode: bool,
     include_normalized_exact_pass: bool,
+    resolution_mode: EntityResolutionMode,
 ) -> dict[str, Any]:
     """Mark a run as active immediately so status checks don't race the background task."""
     clear_sse_queue(world_id)
@@ -170,8 +197,9 @@ def begin_entity_resolution_run(
         message="Preparing entity resolution.",
         reason=None,
         top_k=top_k,
+        resolution_mode=resolution_mode,
         review_mode=review_mode,
-        include_normalized_exact_pass=include_normalized_exact_pass,
+        include_normalized_exact_pass=_mode_uses_exact_pass(resolution_mode),
         total_entities=0,
         resolved_entities=0,
         unresolved_entities=0,
@@ -476,6 +504,7 @@ def _update_meta_from_state(world_id: str, state: dict[str, Any], graph_store: G
     meta["entity_resolution_resolved_entities"] = state.get("resolved_entities", 0)
     meta["entity_resolution_unresolved_entities"] = state.get("unresolved_entities", 0)
     meta["entity_resolution_auto_resolved_pairs"] = state.get("auto_resolved_pairs", 0)
+    meta["entity_resolution_mode"] = state.get("resolution_mode")
     meta["entity_resolution_review_mode"] = state.get("review_mode", False)
     meta["entity_resolution_exact_pass"] = state.get("include_normalized_exact_pass", True)
     meta["entity_resolution_updated_at"] = state.get("updated_at")
@@ -490,6 +519,7 @@ async def start_entity_resolution(
     top_k: int,
     review_mode: bool,
     include_normalized_exact_pass: bool,
+    resolution_mode: EntityResolutionMode,
 ) -> None:
     abort_event = _abort_events.get(world_id)
     if abort_event is None:
@@ -500,6 +530,12 @@ async def start_entity_resolution(
     graph_store = GraphStore(world_id)
     initial_ids = list(graph_store.graph.nodes())
     initial_total = len(initial_ids)
+    normalized_resolution_mode = resolve_entity_resolution_mode(
+        resolution_mode,
+        include_normalized_exact_pass,
+    )
+    include_exact_pass = _mode_uses_exact_pass(normalized_resolution_mode)
+    use_ai_pass = _mode_uses_ai_pass(normalized_resolution_mode)
 
     state = _set_state(
         world_id,
@@ -508,8 +544,9 @@ async def start_entity_resolution(
         message="Preparing entity resolution.",
         reason=None,
         top_k=top_k,
+        resolution_mode=normalized_resolution_mode,
         review_mode=review_mode,
-        include_normalized_exact_pass=include_normalized_exact_pass,
+        include_normalized_exact_pass=include_exact_pass,
         total_entities=initial_total,
         resolved_entities=0,
         unresolved_entities=initial_total,
@@ -540,7 +577,7 @@ async def start_entity_resolution(
         processed_count = 0
         auto_resolved_pairs = 0
 
-        if include_normalized_exact_pass:
+        if include_exact_pass:
             state = _set_state(world_id, phase="exact_match_pass", message="Running exact match pass after normalization.")
             _update_meta_from_state(world_id, state, graph_store)
             push_sse_event(world_id, {"event": "progress", **state})
@@ -584,6 +621,23 @@ async def start_entity_resolution(
 
             if pending_exact_saves:
                 graph_store.save()
+
+        if not use_ai_pass:
+            state = _set_state(
+                world_id,
+                status="complete",
+                phase="complete",
+                message="Exact-only entity resolution complete.",
+                reason=None,
+                resolved_entities=processed_count,
+                unresolved_entities=len(remaining_ids),
+                current_anchor=None,
+                current_candidates=[],
+                auto_resolved_pairs=auto_resolved_pairs,
+            )
+            _update_meta_from_state(world_id, state, graph_store)
+            push_sse_event(world_id, {"event": "complete", **state})
+            return
 
         while remaining_ids:
             _ensure_not_aborted(world_id, abort_event)

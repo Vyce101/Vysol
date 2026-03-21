@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -17,6 +18,7 @@ from core.entity_resolution_engine import (
     drain_sse_events,
     get_resolution_current,
     get_resolution_status,
+    resolve_entity_resolution_mode,
     start_entity_resolution,
 )
 
@@ -27,6 +29,7 @@ class EntityResolutionStartRequest(BaseModel):
     top_k: int = 50
     review_mode: bool = False
     include_normalized_exact_pass: bool = True
+    resolution_mode: Literal["exact_only", "exact_then_ai"] | None = None
 
 
 def _load_meta(world_id: str) -> dict:
@@ -42,6 +45,7 @@ def _run_entity_resolution_in_thread(
     top_k: int,
     review_mode: bool,
     include_normalized_exact_pass: bool,
+    resolution_mode: str | None,
 ) -> None:
     asyncio.run(
         start_entity_resolution(
@@ -49,6 +53,7 @@ def _run_entity_resolution_in_thread(
             top_k,
             review_mode,
             include_normalized_exact_pass,
+            resolve_entity_resolution_mode(resolution_mode, include_normalized_exact_pass),
         )
     )
 
@@ -62,11 +67,16 @@ async def entity_resolution_start(world_id: str, req: EntityResolutionStartReque
     if current_status.get("status") == "in_progress":
         raise HTTPException(status_code=409, detail="Entity resolution is already in progress.")
 
+    resolution_mode = resolve_entity_resolution_mode(
+        req.resolution_mode,
+        req.include_normalized_exact_pass,
+    )
     state = begin_entity_resolution_run(
         world_id,
         max(1, req.top_k),
         req.review_mode,
         req.include_normalized_exact_pass,
+        resolution_mode,
     )
     thread = threading.Thread(
         target=_run_entity_resolution_in_thread,
@@ -75,6 +85,7 @@ async def entity_resolution_start(world_id: str, req: EntityResolutionStartReque
             max(1, req.top_k),
             req.review_mode,
             req.include_normalized_exact_pass,
+            resolution_mode,
         ),
         daemon=True,
         name=f"entity-resolution-{world_id}",

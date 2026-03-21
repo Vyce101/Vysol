@@ -17,10 +17,12 @@ export class ApiError extends Error {
     }
 }
 
+export type EntityResolutionMode = "exact_only" | "exact_then_ai";
+export type EntityResolutionRunMode = EntityResolutionMode | "ai_only";
+
 export interface EntityResolutionStartRequest {
     top_k: number;
-    review_mode: boolean;
-    include_normalized_exact_pass: boolean;
+    resolution_mode: EntityResolutionMode;
 }
 
 export interface EntityResolutionStatus {
@@ -34,6 +36,9 @@ export interface EntityResolutionStatus {
     unresolved_entities?: number;
     auto_resolved_pairs?: number;
     top_k?: number;
+    resolution_mode?: EntityResolutionRunMode;
+    include_normalized_exact_pass?: boolean;
+    review_mode?: boolean;
     current_anchor?: {
         node_id?: string;
         display_name?: string;
