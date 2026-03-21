@@ -76,9 +76,13 @@ type RenderLink = GraphViewerLink & {
 const LINK_CURVATURE = 0.25;
 const DEFAULT_LINK_WIDTH = 1.45;
 const LINK_HOVER_PRECISION = 10;
+const BASE_NODE_RADIUS = 6;
+const NODE_RADIUS_CONNECTION_MULTIPLIER = 3.2;
+const CHARGE_RADIUS_MULTIPLIER = 26;
+const LINK_DISTANCE_RADIUS_MULTIPLIER = 1.45;
 
 const getNodeRadius = (node: Pick<GraphViewerNode, "connection_count"> | null | undefined) =>
-    Math.max(5, Math.min(20, 5 + Math.sqrt(node?.connection_count || 0) * 2.5));
+    Math.max(BASE_NODE_RADIUS, BASE_NODE_RADIUS + Math.sqrt(node?.connection_count || 0) * NODE_RADIUS_CONNECTION_MULTIPLIER);
 
 const getNodePosition = (node: Pick<GraphViewerNode, "x" | "y">) => ({
     x: typeof node.x === "number" ? node.x : 0,
@@ -285,16 +289,16 @@ export default function InteractiveGraphViewer(props: {
         const chargeForce = graphRef.current.d3Force("charge");
         chargeForce?.strength?.((rawNode) => {
             const node = rawNode as RenderNode;
-            return -220 - getNodeRadius(node) * 16;
+            return -240 - getNodeRadius(node) * CHARGE_RADIUS_MULTIPLIER;
         });
-        chargeForce?.distanceMax?.(900);
+        chargeForce?.distanceMax?.(1200);
 
         const linkForce = graphRef.current.d3Force("link");
         linkForce?.distance?.((rawLink) => {
             const link = rawLink as RenderLink;
             const sourceNode = getLinkedNode(link.source);
             const targetNode = getLinkedNode(link.target);
-            return 110 + getNodeRadius(sourceNode) + getNodeRadius(targetNode);
+            return 120 + (getNodeRadius(sourceNode) + getNodeRadius(targetNode)) * LINK_DISTANCE_RADIUS_MULTIPLIER;
         });
         linkForce?.strength?.(0.07);
 
