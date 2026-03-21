@@ -113,6 +113,13 @@ interface ProgressState {
     operation: string;
 }
 
+function normalizeGleanAmount(value: unknown): number {
+    const raw = typeof value === "string" ? value.trim() : String(value ?? "");
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed)) return 1;
+    return Math.min(5, Math.max(0, Math.trunc(parsed)));
+}
+
 export default function IngestPage({ params }: { params: Promise<{ worldId: string }> }) {
     const { worldId } = use(params);
     const initialProgress: ProgressState = {
@@ -143,6 +150,7 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
     const [embeddingModel, setEmbeddingModel] = useState("gemini-embedding-002-preview");
     const [savedIngestSettings, setSavedIngestSettings] = useState<IngestSettings | null>(null);
     const [gleanAmount, setGleanAmount] = useState(1);
+    const [gleanAmountDraft, setGleanAmountDraft] = useState("1");
     const [prompts, setPrompts] = useState<Record<string, { value: string; source: string }>>({});
     const [blockedChunkData, setBlockedChunkData] = useState<{ text: string; reason: string } | null>(null);
 
@@ -175,7 +183,9 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
     async function loadSettings() {
         try {
             const data = await apiFetch<SettingsResponse>(`/settings`);
-            if (data.glean_amount !== undefined) setGleanAmount(data.glean_amount);
+            const normalized = normalizeGleanAmount(data.glean_amount);
+            setGleanAmount(normalized);
+            setGleanAmountDraft(String(normalized));
         } catch { /* ignore */ }
     }
 
@@ -394,13 +404,22 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
 
     const saveAgentSettings = async () => {
         try {
+            const normalized = normalizeGleanAmount(gleanAmountDraft);
+            setGleanAmount(normalized);
+            setGleanAmountDraft(String(normalized));
             await apiFetch("/settings", {
                 method: "POST",
                 body: JSON.stringify({
-                    glean_amount: gleanAmount,
+                    glean_amount: normalized,
                 }),
             });
         } catch { /* ignore */ }
+    };
+
+    const commitGleanDraft = () => {
+        const normalized = normalizeGleanAmount(gleanAmountDraft);
+        setGleanAmount(normalized);
+        setGleanAmountDraft(String(normalized));
     };
 
     const hasPending = sources.some((s) => s.status === "pending" || s.status === "ingesting");
@@ -730,7 +749,15 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
                     </div>
                     <div style={{ marginBottom: 16 }}>
                         <label style={{ fontSize: 12, color: "var(--text-subtle)", marginBottom: 4, display: "block" }}>Graph Architect Glean Amount (iterations)</label>
-                        <input type="number" min="0" max="5" value={gleanAmount} onChange={(e) => setGleanAmount(Number(e.target.value))} style={{ width: "100%" }} />
+                        <input
+                            type="number"
+                            min="0"
+                            max="5"
+                            value={gleanAmountDraft}
+                            onChange={(e) => setGleanAmountDraft(e.target.value)}
+                            onBlur={commitGleanDraft}
+                            style={{ width: "100%" }}
+                        />
                     </div>
                     <button onClick={saveAgentSettings} style={{ ...btnStyle, background: "var(--primary)", color: "var(--primary-contrast)", width: "100%" }}>
                         Save Graph Architect Settings

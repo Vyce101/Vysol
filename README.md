@@ -15,6 +15,11 @@ You can ingest plain-text source material, control how the graph is built, resol
 
 This project is licensed under the GNU AGPLv3. Companies requiring a commercial license should see [COMMERCIAL.md](COMMERCIAL.md).
 
+## Supported OS
+
+- Windows: Supported (`VySol.bat` launcher)
+- macOS/Linux: Manual setup only (no supported launcher path yet)
+
 ## What This Project Is
 
 VySol is meant to be a graph RAG app that is easy to use, easy to set up, and flexible enough for people who want control over how their graph is made.

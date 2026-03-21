@@ -1472,7 +1472,7 @@ async def start_ingestion(
                     final_nodes = list(ga_output.nodes)
                     final_edges = list(ga_output.edges)
 
-                    glean_amount = int(settings.get("glean_amount", 0))
+                    glean_amount = int(settings.get("glean_amount", 1))
                     for g_idx in range(max(0, glean_amount)):
                         push_sse_event(
                             world_id,
