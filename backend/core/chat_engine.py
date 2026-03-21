@@ -18,6 +18,18 @@ from .retrieval_engine import RetrievalEngine
 logger = logging.getLogger(__name__)
 
 
+def _build_gemini_sdk_content(role: str, text: str) -> types.Content:
+    part = types.Part.from_text(text=text)
+    if role == "assistant":
+        return types.ModelContent(parts=[part])
+    return types.UserContent(parts=[part])
+
+
+def _build_gemini_debug_content(role: str, text: str) -> dict:
+    gemini_role = "model" if role == "assistant" else "user"
+    return {"role": gemini_role, "parts": [text]}
+
+
 def stream_chat(
     world_id: str,
     message: str,
@@ -82,17 +94,18 @@ def stream_chat(
         intenserp_model_id = settings.get("intenserp_model_id", "glm-chat")
         captured_at = datetime.now(timezone.utc).isoformat()
 
-        gemini_contents = []
+        gemini_sdk_contents = []
+        gemini_debug_contents = []
         for msg in messages_payload:
             if msg["role"] == "system":
                 continue
-            gemini_role = "model" if msg["role"] == "assistant" else "user"
-            gemini_contents.append({"role": gemini_role, "parts": [msg["content"]]})
+            gemini_sdk_contents.append(_build_gemini_sdk_content(msg["role"], msg["content"]))
+            gemini_debug_contents.append(_build_gemini_debug_content(msg["role"], msg["content"]))
 
         # context_payload stays model-context only. Metadata goes to context_meta.
         gemini_context_payload = {
             "system_instruction": full_system,
-            "contents": gemini_contents,
+            "contents": gemini_debug_contents,
         }
         gemini_context_meta = {
             "schema_version": "model_context.v1",
@@ -159,7 +172,7 @@ def stream_chat(
 
         response = client.models.generate_content_stream(
             model=model_name,
-            contents=gemini_contents,
+            contents=gemini_sdk_contents,
             config=config,
         )
 

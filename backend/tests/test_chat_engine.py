@@ -1,6 +1,7 @@
 import json
 
 from core import chat_engine
+from google.genai import types
 
 
 def _parse_sse_events(chunks: list[str]) -> list[dict]:
@@ -98,13 +99,23 @@ def test_stream_chat_gemini_emits_exact_context_payload_and_separate_meta(monkey
     assert done["nodes_used"] == [{"id": "a", "display_name": "A", "entity_type": "Unknown"}]
     assert done["context_payload"] == {
         "system_instruction": captured["system_instruction"],
-        "contents": captured["contents"],
+        "contents": [
+            {"role": "user", "parts": ["older user"]},
+            {"role": "model", "parts": ["older model"]},
+            {"role": "user", "parts": ["latest user"]},
+        ],
     }
-    assert done["context_payload"]["contents"] == [
-        {"role": "user", "parts": ["older user"]},
-        {"role": "model", "parts": ["older model"]},
-        {"role": "user", "parts": ["latest user"]},
-    ]
+    assert len(captured["contents"]) == 3
+    assert isinstance(captured["contents"][0], types.UserContent)
+    assert isinstance(captured["contents"][1], types.ModelContent)
+    assert isinstance(captured["contents"][2], types.UserContent)
+    assert captured["contents"][0].role == "user"
+    assert captured["contents"][1].role == "model"
+    assert captured["contents"][2].role == "user"
+    assert captured["contents"][0].parts[0].text == "older user"
+    assert captured["contents"][1].parts[0].text == "older model"
+    assert captured["contents"][2].parts[0].text == "latest user"
+    assert all(not isinstance(part, str) for content in captured["contents"] for part in content.parts)
     assert "# Entry Nodes" in done["context_payload"]["system_instruction"]
     assert "# Graph Nodes" in done["context_payload"]["system_instruction"]
     assert "# Graph Edges" in done["context_payload"]["system_instruction"]
