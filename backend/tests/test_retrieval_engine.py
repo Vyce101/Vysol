@@ -323,7 +323,8 @@ def test_retrieve_context_keeps_graph_dedup_and_edge_dedup(monkeypatch):
     assert context.index("# Entry Nodes") < context.index("# Graph Nodes")
     assert "Node A: entryA" in context
     assert "Node A: descB descC" in context
-    assert "Node B: descX descY" in context
+    assert "Node B: descX descX" in context
+    assert "Node B: descY" in context
     assert context.count("[B1:C2] Node B, knows, Node B") == 1
 
 
@@ -370,7 +371,7 @@ def test_retrieve_context_sorts_graph_edges_by_book_then_chunk(monkeypatch):
     assert context.index(second_edge) < context.index(third_edge)
 
 
-def test_retrieve_builds_context_graph_snapshot_from_merged_nodes_and_sorted_edges(monkeypatch):
+def test_retrieve_builds_context_graph_snapshot_from_real_nodes_and_sorted_edges(monkeypatch):
     _patch_retrieval_dependencies(
         monkeypatch,
         bfs_nodes=[
@@ -402,21 +403,26 @@ def test_retrieve_builds_context_graph_snapshot_from_merged_nodes_and_sorted_edg
     result = engine.retrieve("test query")
     context_graph = result["context_graph"]
 
-    assert context_graph["schema_version"] == "context_graph.v1"
-    assert [node["label"] for node in context_graph["nodes"]] == ["2B", "9S"]
-    assert context_graph["nodes"][0]["description"] == "Entry desc Graph desc three"
+    assert context_graph["schema_version"] == "context_graph.v2"
+    assert [(node["id"], node["label"], node["is_entry_node"]) for node in context_graph["nodes"]] == [
+        ("entry-1", "2B", True),
+        ("g3", "2B", False),
+        ("g2", "9S", False),
+    ]
+    assert context_graph["nodes"][0]["description"] == "Entry desc"
+    assert context_graph["nodes"][1]["description"] == "Graph desc three"
     assert context_graph["edges"] == [
         {
-            "source": "9S",
-            "target": "2B",
+            "source": "g2",
+            "target": "g3",
             "description": "earlier edge",
             "strength": 1,
             "source_book": 1,
             "source_chunk": 0,
         },
         {
-            "source": "2B",
-            "target": "9S",
+            "source": "entry-1",
+            "target": "g2",
             "description": "later edge",
             "strength": 1,
             "source_book": 1,
@@ -424,7 +430,57 @@ def test_retrieve_builds_context_graph_snapshot_from_merged_nodes_and_sorted_edg
         },
     ]
     assert context_graph["nodes"][0]["connection_count"] == 1
-    assert context_graph["nodes"][1]["neighbors"][0]["label"] == "2B"
+    assert context_graph["nodes"][0]["neighbors"][0]["id"] == "g2"
+    assert context_graph["nodes"][1]["neighbors"][0]["label"] == "9S"
+
+
+def test_retrieve_preserves_duplicate_display_names_in_model_context(monkeypatch):
+    _patch_retrieval_dependencies(
+        monkeypatch,
+        bfs_nodes=[
+            {"id": "entry-1", "display_name": "Command", "description": "Entry version"},
+            {"id": "graph-2", "display_name": "Command", "description": "Expanded version"},
+        ],
+        graph_nodes=[
+            ("entry-1", {"display_name": "Command", "description": "Entry version"}),
+            ("graph-2", {"display_name": "Command", "description": "Expanded version"}),
+        ],
+        chunk_results=[{"id": "chunk-1", "document": "seed"}],
+        node_results=[{"id": "entry-1"}],
+        settings={
+            "retrieval_top_k_chunks": 1,
+            "retrieval_entry_top_k_nodes": 1,
+            "retrieval_graph_hops": 2,
+            "retrieval_max_nodes": 20,
+        },
+    )
+
+    engine = retrieval_engine.RetrievalEngine("world-1")
+    result = engine.retrieve("test query")
+    context = result["context_string"]
+
+    assert context.count("Command: Entry version") == 1
+    assert context.count("Command: Expanded version") == 1
+    assert result["context_graph"]["nodes"] == [
+        {
+            "id": "entry-1",
+            "label": "Command",
+            "description": "Entry version",
+            "entity_type": "Unknown",
+            "is_entry_node": True,
+            "connection_count": 0,
+            "neighbors": [],
+        },
+        {
+            "id": "graph-2",
+            "label": "Command",
+            "description": "Expanded version",
+            "entity_type": "Unknown",
+            "is_entry_node": False,
+            "connection_count": 0,
+            "neighbors": [],
+        },
+    ]
 
 
 def test_retrieve_entry_nodes_are_excluded_from_graph_nodes_section(monkeypatch):

@@ -23,6 +23,7 @@ All notable user-visible changes to this project will be documented in this file
 - Documented API key toggle behavior in the walkthrough and Google AI Studio key guide.
 - Renamed the default embedding model to `gemini-embedding-2-preview`.
 - Changed retrieval entry-node indexing to use one persistent vector per current graph node, with `Re-embed All` rebuilding from the current saved graph state.
+- Changed model-context assembly and Context X-Ray to preserve real graph nodes even when different nodes share the same display name, instead of fake-merging them by label.
 
 ### Fixed
 
@@ -32,6 +33,7 @@ All notable user-visible changes to this project will be documented in this file
 - Fixed graph edge hover details to show source and target names plus provenance in the graph viewer.
 - Fixed graph viewer startup layout so first-open graphs spread correctly and auto-fit no longer hijacks manual navigation.
 - Fixed graph node hitboxes, shared graph-viewer modal sizing, context-graph interaction regressions, and uniform edge hover behavior across the graph tab and Context Graph.
+- Fixed Context Graph role visibility by explicitly labeling entry nodes versus expanded nodes in the graph legend, tooltips, and inspector.
 
 ### Removed
 

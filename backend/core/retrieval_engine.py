@@ -30,6 +30,10 @@ def _edge_temporal_sort_key(edge: dict) -> tuple[int, int]:
     return book, chunk
 
 
+def _normalize_context_text(value: str) -> str:
+    return " ".join(part.strip() for part in str(value or "").splitlines() if part.strip())
+
+
 class RetrievalEngine:
     """Performs GraphRAG retrieval: vector query → graph walk → context assembly."""
 
@@ -133,6 +137,10 @@ class RetrievalEngine:
                 u_name = u_node.get("display_name", u)
                 v_name = v_node.get("display_name", v)
                 graph_edges.append({
+                    "source_id": u,
+                    "target_id": v,
+                    "source_label": u_name,
+                    "target_label": v_name,
                     "source": u_name,
                     "target": v_name,
                     "label": attrs.get("label", ""),
@@ -240,18 +248,20 @@ class RetrievalEngine:
         # Edges
         if graph_edges:
             edge_strs = []
-            unique_edges = set()
+            unique_edges: set[tuple[str, str, str, int, int]] = set()
             for edge in sorted(graph_edges, key=_edge_temporal_sort_key):
-                s = edge.get("source", "?")
-                t = edge.get("target", "?")
-                desc = edge.get("description", "")
-                book = edge.get("source_book", 0)
-                chunk_id = edge.get("source_chunk", 0)
-                temporal_prefix = f"[B{book}:C{chunk_id}] " if book or chunk_id else ""
-                edge_str = f"{temporal_prefix}{s}, {desc}, {t}"
-                if edge_str not in unique_edges:
-                    unique_edges.add(edge_str)
-                    edge_strs.append(edge_str)
+                edge_identity = (
+                    str(edge.get("source_id", edge.get("source", ""))),
+                    str(edge.get("target_id", edge.get("target", ""))),
+                    str(edge.get("description", "")),
+                    int(edge.get("source_book", 0) or 0),
+                    int(edge.get("source_chunk", 0) or 0),
+                )
+                if edge_identity in unique_edges:
+                    continue
+
+                unique_edges.add(edge_identity)
+                edge_strs.append(self._format_context_edge_line(edge))
             parts.append("# Graph Edges\n" + "\n".join(edge_strs))
 
         # RAG Chunks (scrubbed of B{X}:C{Y} tags and deduplicated)
@@ -271,49 +281,30 @@ class RetrievalEngine:
         return "\n\n".join(parts)
 
     def _format_context_edge_line(self, edge: dict) -> str:
-        s = edge.get("source", "?")
-        t = edge.get("target", "?")
-        desc = edge.get("description", "")
+        s = edge.get("source_label") or edge.get("source", "?")
+        t = edge.get("target_label") or edge.get("target", "?")
+        desc = _normalize_context_text(edge.get("description", ""))
         book = edge.get("source_book", 0)
         chunk_id = edge.get("source_chunk", 0)
         temporal_prefix = f"[B{book}:C{chunk_id}] " if book or chunk_id else ""
         return f"{temporal_prefix}{s}, {desc}, {t}"
 
-    def _merge_nodes_by_display_name(self, nodes: list[dict]) -> dict[str, dict]:
-        unique_nodes: dict[str, dict] = {}
-        for node in nodes:
-            name = node.get("display_name", "Unknown")
-            raw_desc = node.get("description", "").strip()
-            desc_parts = [d.strip() for d in raw_desc.split('\n') if d.strip()]
-
-            if name not in unique_nodes:
-                unique_nodes[name] = {
-                    "name": name,
-                    "description_parts": [],
-                    "entity_type": node.get("entity_type") or "Unknown",
-                }
-
-            merged_node = unique_nodes[name]
-            if merged_node["entity_type"] in {"", "Unknown"} and node.get("entity_type"):
-                merged_node["entity_type"] = node["entity_type"]
-
-            for dp in desc_parts:
-                if dp not in merged_node["description_parts"]:
-                    merged_node["description_parts"].append(dp)
-
-        return unique_nodes
-
     def _build_nodes_section(self, heading: str, nodes: list[dict]) -> str:
-        unique_nodes = self._merge_nodes_by_display_name(nodes)
+        node_lines: list[str] = []
+        seen_node_ids: set[str] = set()
+        for node in nodes:
+            node_id = str(node.get("id", "") or "")
+            if not node_id or node_id in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id)
+            display_name = str(node.get("display_name") or node_id or "Unknown")
+            description = _normalize_context_text(node.get("description", ""))
+            node_lines.append(f"{display_name}: {description}")
 
-        if not unique_nodes:
+        if not node_lines:
             return ""
 
-        node_strs = []
-        for name, merged_node in unique_nodes.items():
-            merged_desc = " ".join(merged_node["description_parts"])
-            node_strs.append(f"{name}: {merged_desc}")
-        return heading + "\n" + "\n".join(node_strs)
+        return heading + "\n" + "\n".join(node_lines)
 
     def _build_context_graph_snapshot(
         self,
@@ -321,80 +312,107 @@ class RetrievalEngine:
         graph_nodes: list[dict],
         graph_edges: list[dict],
     ) -> dict:
-        merged_nodes = self._merge_nodes_by_display_name([*entry_nodes, *graph_nodes])
+        entry_node_ids = {str(node.get("id", "")) for node in entry_nodes if node.get("id")}
+        snapshot_nodes_by_id: dict[str, dict] = {}
+        for node in [*entry_nodes, *graph_nodes]:
+            node_id = str(node.get("id", "") or "")
+            if not node_id:
+                continue
+            snapshot_nodes_by_id.setdefault(node_id, {
+                "id": node_id,
+                "label": str(node.get("display_name") or node_id or "Unknown"),
+                "description": _normalize_context_text(node.get("description", "")),
+                "entity_type": node.get("entity_type") or "Unknown",
+                "is_entry_node": node_id in entry_node_ids,
+            })
+
         ordered_edges: list[dict] = []
-        seen_edge_lines: set[str] = set()
+        seen_edges: set[tuple[str, str, str, int, int]] = set()
 
         for edge in sorted(graph_edges, key=_edge_temporal_sort_key):
-            edge_line = self._format_context_edge_line(edge)
-            if edge_line in seen_edge_lines:
+            source_id = str(edge.get("source_id", "") or "")
+            target_id = str(edge.get("target_id", "") or "")
+            edge_identity = (
+                source_id,
+                target_id,
+                str(edge.get("description", "")),
+                int(edge.get("source_book", 0) or 0),
+                int(edge.get("source_chunk", 0) or 0),
+            )
+            if edge_identity in seen_edges:
                 continue
 
-            seen_edge_lines.add(edge_line)
-            source_name = edge.get("source", "?")
-            target_name = edge.get("target", "?")
-            description = edge.get("description", "")
-
-            merged_nodes.setdefault(source_name, {
-                "name": source_name,
-                "description_parts": [],
+            seen_edges.add(edge_identity)
+            source_name = str(edge.get("source_label") or edge.get("source") or source_id or "Unknown")
+            target_name = str(edge.get("target_label") or edge.get("target") or target_id or "Unknown")
+            snapshot_nodes_by_id.setdefault(source_id, {
+                "id": source_id,
+                "label": source_name,
+                "description": "",
                 "entity_type": "Unknown",
+                "is_entry_node": source_id in entry_node_ids,
             })
-            merged_nodes.setdefault(target_name, {
-                "name": target_name,
-                "description_parts": [],
+            snapshot_nodes_by_id.setdefault(target_id, {
+                "id": target_id,
+                "label": target_name,
+                "description": "",
                 "entity_type": "Unknown",
+                "is_entry_node": target_id in entry_node_ids,
             })
             ordered_edges.append({
-                "source": source_name,
-                "target": target_name,
-                "description": description,
+                "source": source_id,
+                "target": target_id,
+                "description": _normalize_context_text(edge.get("description", "")),
                 "strength": 1,
                 "source_book": edge.get("source_book", 0),
                 "source_chunk": edge.get("source_chunk", 0),
             })
 
-        neighbor_map: dict[str, dict[str, str]] = {name: {} for name in merged_nodes}
+        neighbor_map: dict[str, dict[str, str]] = {node_id: {} for node_id in snapshot_nodes_by_id}
         for edge in ordered_edges:
-            source_name = edge["source"]
-            target_name = edge["target"]
+            source_id = edge["source"]
+            target_id = edge["target"]
             description = edge.get("description", "") or ""
 
-            if target_name not in neighbor_map[source_name]:
-                neighbor_map[source_name][target_name] = description
-            elif not neighbor_map[source_name][target_name] and description:
-                neighbor_map[source_name][target_name] = description
+            if target_id not in neighbor_map[source_id]:
+                neighbor_map[source_id][target_id] = description
+            elif not neighbor_map[source_id][target_id] and description:
+                neighbor_map[source_id][target_id] = description
 
-            if source_name not in neighbor_map[target_name]:
-                neighbor_map[target_name][source_name] = description
-            elif not neighbor_map[target_name][source_name] and description:
-                neighbor_map[target_name][source_name] = description
+            if source_id not in neighbor_map[target_id]:
+                neighbor_map[target_id][source_id] = description
+            elif not neighbor_map[target_id][source_id] and description:
+                neighbor_map[target_id][source_id] = description
 
         serialized_nodes = []
-        for name in sorted(merged_nodes, key=str.lower):
-            merged_node = merged_nodes[name]
+        for node_id in sorted(snapshot_nodes_by_id, key=lambda value: ((snapshot_nodes_by_id[value].get("label") or value).lower(), value.lower())):
+            snapshot_node = snapshot_nodes_by_id[node_id]
             neighbors = [
                 {
-                    "id": neighbor_name,
-                    "label": neighbor_name,
+                    "id": neighbor_id,
+                    "label": snapshot_nodes_by_id.get(neighbor_id, {}).get("label", neighbor_id),
                     "description": neighbor_description,
                 }
-                for neighbor_name, neighbor_description in sorted(
-                    neighbor_map.get(name, {}).items(),
-                    key=lambda item: item[0].lower(),
+                for neighbor_id, neighbor_description in sorted(
+                    neighbor_map.get(node_id, {}).items(),
+                    key=lambda item: (
+                        snapshot_nodes_by_id.get(item[0], {}).get("label", item[0]).lower(),
+                        item[0].lower(),
+                    ),
                 )
             ]
             serialized_nodes.append({
-                "id": name,
-                "label": name,
-                "description": " ".join(merged_node["description_parts"]),
-                "entity_type": merged_node["entity_type"],
+                "id": node_id,
+                "label": snapshot_node["label"],
+                "description": snapshot_node["description"],
+                "entity_type": snapshot_node["entity_type"],
+                "is_entry_node": snapshot_node["is_entry_node"],
                 "connection_count": len(neighbors),
                 "neighbors": neighbors,
             })
 
         return {
-            "schema_version": "context_graph.v1",
+            "schema_version": "context_graph.v2",
             "nodes": serialized_nodes,
             "edges": ordered_edges,
         }

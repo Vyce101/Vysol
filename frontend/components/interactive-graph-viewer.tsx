@@ -33,6 +33,8 @@ export interface GraphViewerNode {
     id: string;
     label: string;
     description: string;
+    entity_type?: string;
+    is_entry_node?: boolean;
     claim_count?: number;
     connection_count: number;
     source_chunks?: string[];
@@ -57,6 +59,7 @@ export interface GraphViewerNodeDetail {
     id: string;
     display_name: string;
     description: string;
+    is_entry_node?: boolean;
     source_chunks?: string[];
     created_at?: string;
     connection_count?: number;
@@ -129,11 +132,22 @@ function getFallbackNodeDetail(node: GraphViewerNode): GraphViewerNodeDetail {
         id: node.id,
         display_name: node.label,
         description: node.description,
+        is_entry_node: node.is_entry_node,
         source_chunks: node.source_chunks,
         created_at: node.created_at,
         connection_count: node.connection_count,
         claims: node.claims || [],
         neighbors: node.neighbors || [],
+    };
+}
+
+function getEntryRolePresentation(node: { is_entry_node?: boolean } | null | undefined) {
+    const isEntryNode = Boolean(node?.is_entry_node);
+    return {
+        label: isEntryNode ? "Entry Node" : "Expanded Node",
+        background: isEntryNode ? "var(--primary-soft)" : "var(--status-info-soft-bg)",
+        border: isEntryNode ? "var(--primary-soft-strong)" : "var(--status-info-soft-border)",
+        color: isEntryNode ? "var(--primary-light)" : "var(--status-info-pill-fg)",
     };
 }
 
@@ -150,6 +164,7 @@ export default function InteractiveGraphViewer(props: {
     showRefreshButton?: boolean;
     onRefresh?: () => void | Promise<void>;
     showColorToggle?: boolean;
+    useEntryRoleColors?: boolean;
     showFitButton?: boolean;
     fitButtonLabel?: string;
 }) {
@@ -166,6 +181,7 @@ export default function InteractiveGraphViewer(props: {
         showRefreshButton = false,
         onRefresh,
         showColorToggle = false,
+        useEntryRoleColors = false,
         showFitButton = true,
         fitButtonLabel = "Fit View",
     } = props;
@@ -369,10 +385,15 @@ export default function InteractiveGraphViewer(props: {
     const nodeCanvasObject = useCallback(
         (node: RenderNode, ctx: CanvasRenderingContext2D) => {
             const primaryNodeColor = readThemeVar("--graph-node", "#7c3aed");
+            const entryNodeColor = readThemeVar("--primary", "#7c3aed");
+            const expandedNodeColor = readThemeVar("--status-info-pill-fg", "#60a5fa");
             const labelColor = readThemeVar("--graph-label", "rgba(255,255,255,0.9)");
-            const color = colorBySource && node.source_chunks && node.source_chunks.length > 0
-                ? getSourceColor(node.source_chunks[0])
-                : primaryNodeColor;
+            let color = primaryNodeColor;
+            if (useEntryRoleColors) {
+                color = node.is_entry_node ? entryNodeColor : expandedNodeColor;
+            } else if (colorBySource && node.source_chunks && node.source_chunks.length > 0) {
+                color = getSourceColor(node.source_chunks[0]);
+            }
             const isSearching = searchResults.length > 0;
             const isMatch = searchResults.includes(node.id);
             const opacity = isSearching ? (isMatch ? 1 : 0.1) : 1;
@@ -387,7 +408,7 @@ export default function InteractiveGraphViewer(props: {
             ctx.fillText(node.label, x, y + radius + 8);
             ctx.globalAlpha = 1;
         },
-        [colorBySource, getSourceColor, searchResults]
+        [colorBySource, getSourceColor, searchResults, useEntryRoleColors]
     );
 
     const getLinkStrokeStyle = useCallback((link: RenderLink) => {
@@ -398,7 +419,7 @@ export default function InteractiveGraphViewer(props: {
         const targetMatch = searchResults.includes(targetId);
         const opacity = isSearching ? (sourceMatch && targetMatch ? 0.6 : 0.05) : 0.4;
 
-        if (colorBySource && link.source_book) {
+        if (!useEntryRoleColors && colorBySource && link.source_book) {
             const color = getSourceColor(link.source_book);
             return color.replace("hsl", "hsla").replace(")", `, ${opacity})`);
         }
@@ -410,7 +431,7 @@ export default function InteractiveGraphViewer(props: {
             }
             return `rgba(74, 74, 74, ${opacity})`;
         });
-    }, [colorBySource, getSourceColor, searchResults]);
+    }, [colorBySource, getSourceColor, searchResults, useEntryRoleColors]);
 
     const resolveNodeClick = useCallback(async (node: GraphViewerNode) => {
         const nextDetail = resolveNodeDetail
@@ -468,9 +489,11 @@ export default function InteractiveGraphViewer(props: {
                             const createdAt = node.created_at ? new Date(node.created_at).toLocaleString() : null;
                             const connectionLine = `${node.connection_count || 0} connected nodes`;
                             const claimsLine = typeof node.claim_count === "number" ? `${node.claim_count} claims found` : null;
+                            const rolePresentation = useEntryRoleColors ? getEntryRolePresentation(node) : null;
                             return `
                                 <div style="background: var(--tooltip-bg); padding: 12px; border: 1px solid var(--tooltip-border); border-radius: 8px; color: var(--tooltip-text); max-width: 300px; box-shadow: 0 4px 20px var(--shadow-color);">
                                     <div style="font-weight: 700; font-size: 14px; margin-bottom: 6px; border-bottom: 1px solid var(--tooltip-strong-border); padding-bottom: 4px; color: var(--primary-light);">${escapeHtml(node.label)}</div>
+                                    ${rolePresentation ? `<div style="display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px; padding: 3px 8px; border-radius: 999px; background: ${rolePresentation.background}; border: 1px solid ${rolePresentation.border}; color: ${rolePresentation.color}; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;">${escapeHtml(rolePresentation.label)}</div>` : ""}
                                     <div style="font-size: 12px; line-height: 1.5; opacity: 0.9;">${escapeHtml(node.description || "No description available.")}</div>
                                     <div style="margin-top: 8px; font-size: 11px; color: var(--primary-light); font-weight: 600;">${escapeHtml(connectionLine)}</div>
                                     ${claimsLine ? `<div style="margin-top: 8px; font-size: 11px; color: var(--tooltip-subtle); font-style: italic;">${escapeHtml(claimsLine)}</div>` : ""}
@@ -503,6 +526,33 @@ export default function InteractiveGraphViewer(props: {
                 {searchOverlay && (
                     <div style={{ position: "absolute", top: 16, left: 16, zIndex: 10 }}>
                         {searchOverlay}
+                    </div>
+                )}
+
+                {useEntryRoleColors && (
+                    <div
+                        style={{
+                            position: "absolute",
+                            top: 16,
+                            left: 16,
+                            zIndex: 10,
+                            display: "flex",
+                            gap: 8,
+                            padding: "8px 10px",
+                            background: "var(--card)",
+                            border: "1px solid var(--border)",
+                            borderRadius: "var(--radius)",
+                            boxShadow: "0 8px 18px rgba(0,0,0,0.14)",
+                        }}
+                    >
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-primary)" }}>
+                            <span style={{ width: 10, height: 10, borderRadius: "50%", background: "var(--primary)", flexShrink: 0 }} />
+                            Entry Node
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "var(--text-primary)" }}>
+                            <span style={{ width: 10, height: 10, borderRadius: "50%", background: "var(--status-info-pill-fg)", flexShrink: 0 }} />
+                            Expanded Node
+                        </div>
                     </div>
                 )}
 
@@ -602,6 +652,27 @@ export default function InteractiveGraphViewer(props: {
                     {visibleSelectedNode ? (
                         <>
                             <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, color: "var(--primary-light)" }}>{visibleSelectedNode.display_name}</h3>
+                            {useEntryRoleColors && (
+                                <div
+                                    style={{
+                                        display: "inline-flex",
+                                        alignItems: "center",
+                                        gap: 6,
+                                        padding: "4px 10px",
+                                        borderRadius: 999,
+                                        marginBottom: 14,
+                                        background: getEntryRolePresentation(visibleSelectedNode).background,
+                                        border: `1px solid ${getEntryRolePresentation(visibleSelectedNode).border}`,
+                                        color: getEntryRolePresentation(visibleSelectedNode).color,
+                                        fontSize: 11,
+                                        fontWeight: 700,
+                                        letterSpacing: "0.04em",
+                                        textTransform: "uppercase",
+                                    }}
+                                >
+                                    {getEntryRolePresentation(visibleSelectedNode).label}
+                                </div>
+                            )}
                             <div style={{ fontSize: 13, lineHeight: 1.6, color: "var(--text-primary)", marginBottom: 20, whiteSpace: "pre-wrap" }}>
                                 {visibleSelectedNode.description}
                             </div>

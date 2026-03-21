@@ -126,150 +126,6 @@ function getContextGraphSnapshot(meta: any): ContextGraphSnapshot | null {
     return snapshot as ContextGraphSnapshot;
 }
 
-function getSystemInstructionFromPayload(payload: any): string {
-    if (payload && typeof payload.system_instruction === "string") {
-        return payload.system_instruction;
-    }
-    if (payload && Array.isArray(payload.messages)) {
-        const systemMessage = payload.messages.find((message: any) => message?.role === "system");
-        if (systemMessage && typeof systemMessage.content === "string") {
-            return systemMessage.content;
-        }
-    }
-    return "";
-}
-
-function parseContextGraphFromPayload(payload: any): ContextGraphSnapshot | null {
-    const systemInstruction = getSystemInstructionFromPayload(payload);
-    if (!systemInstruction) return null;
-
-    const extractSection = (heading: string, nextHeadings: string[]) => {
-        const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const nextPattern = nextHeadings
-            .map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-            .join("|");
-        const regex = new RegExp(`${escapedHeading}\\n([\\s\\S]*?)(?=\\n(?:${nextPattern})|$)`);
-        const match = systemInstruction.match(regex);
-        return match?.[1]?.trim() || "";
-    };
-
-    const entryNodesSection = extractSection("# Entry Nodes", ["# Graph Nodes", "# Graph Edges", "# RAG Chunks", "# Chat History"]);
-    const graphNodesSection = extractSection("# Graph Nodes", ["# Graph Edges", "# RAG Chunks", "# Chat History"]);
-    const graphEdgesSection = extractSection("# Graph Edges", ["# RAG Chunks", "# Chat History"]);
-
-    const nodeMap = new Map<string, { id: string; label: string; description: string; connection_count: number; neighbors: Array<{ id: string; label: string; description: string }> }>();
-    const ensureNode = (name: string, description = "") => {
-        const trimmedName = name.trim();
-        if (!trimmedName) return null;
-        const existing = nodeMap.get(trimmedName);
-        if (existing) {
-            if (description && !existing.description.includes(description)) {
-                existing.description = existing.description ? `${existing.description} ${description}` : description;
-            }
-            return existing;
-        }
-        const created = {
-            id: trimmedName,
-            label: trimmedName,
-            description: description.trim(),
-            connection_count: 0,
-            neighbors: [] as Array<{ id: string; label: string; description: string }>,
-        };
-        nodeMap.set(trimmedName, created);
-        return created;
-    };
-
-    const parseNodeSection = (section: string) => {
-        for (const line of section.split("\n")) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            const separatorIndex = trimmed.indexOf(":");
-            if (separatorIndex === -1) continue;
-            const name = trimmed.slice(0, separatorIndex).trim();
-            const description = trimmed.slice(separatorIndex + 1).trim();
-            ensureNode(name, description);
-        }
-    };
-
-    parseNodeSection(entryNodesSection);
-    parseNodeSection(graphNodesSection);
-
-    const edges: GraphViewerLink[] = [];
-    for (const line of graphEdgesSection.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        const temporalMatch = trimmed.match(/^\[B(\d+):C(\d+)\]\s*(.*)$/);
-        const edgeBody = temporalMatch ? temporalMatch[3].trim() : trimmed;
-        const firstComma = edgeBody.indexOf(",");
-        const lastComma = edgeBody.lastIndexOf(",");
-        if (firstComma === -1 || lastComma === -1 || lastComma <= firstComma) {
-            continue;
-        }
-
-        const sourceName = edgeBody.slice(0, firstComma).trim();
-        const description = edgeBody.slice(firstComma + 1, lastComma).trim();
-        const targetName = edgeBody.slice(lastComma + 1).trim();
-        if (!sourceName || !targetName) continue;
-
-        ensureNode(sourceName);
-        ensureNode(targetName);
-
-        edges.push({
-            source: sourceName,
-            target: targetName,
-            description,
-            strength: 1,
-            source_book: temporalMatch ? Number(temporalMatch[1]) : undefined,
-            source_chunk: temporalMatch ? Number(temporalMatch[2]) : undefined,
-        });
-    }
-
-    if (nodeMap.size === 0 && edges.length === 0) {
-        return null;
-    }
-
-    const neighborMap = new Map<string, Map<string, string>>();
-    for (const edge of edges) {
-        const sourceName = edge.source;
-        const targetName = edge.target;
-        const description = edge.description || "";
-
-        if (!neighborMap.has(sourceName)) neighborMap.set(sourceName, new Map());
-        if (!neighborMap.has(targetName)) neighborMap.set(targetName, new Map());
-
-        if (!neighborMap.get(sourceName)?.has(targetName)) {
-            neighborMap.get(sourceName)?.set(targetName, description);
-        }
-        if (!neighborMap.get(targetName)?.has(sourceName)) {
-            neighborMap.get(targetName)?.set(sourceName, description);
-        }
-    }
-
-    const nodes = Array.from(nodeMap.values())
-        .sort((a, b) => a.label.localeCompare(b.label))
-        .map((node) => {
-            const neighbors = Array.from(neighborMap.get(node.id)?.entries() || [])
-                .sort((a, b) => a[0].localeCompare(b[0]))
-                .map(([neighborName, description]) => ({
-                    id: neighborName,
-                    label: neighborName,
-                    description,
-                }));
-            return {
-                ...node,
-                connection_count: neighbors.length,
-                neighbors,
-            };
-        });
-
-    return {
-        schema_version: "context_graph.fallback.v1",
-        nodes,
-        edges,
-    };
-}
-
 const DIALOGUE_PATTERN = /\u201C[^\u201D\n]+\u201D|"[^"\n]+"/g;
 
 function highlightDialogueText(text: string, keyPrefix: string): React.ReactNode {
@@ -762,8 +618,8 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     const modalPayload = contextModalData?.payload;
     const modalMeta = contextModalData?.meta;
     const modalContextGraph = useMemo(
-        () => getContextGraphSnapshot(modalMeta) || parseContextGraphFromPayload(modalPayload),
-        [modalMeta, modalPayload]
+        () => getContextGraphSnapshot(modalMeta),
+        [modalMeta]
     );
 
     return (
@@ -1214,6 +1070,7 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                                         <InteractiveGraphViewer
                                             nodes={modalContextGraph.nodes}
                                             edges={modalContextGraph.edges}
+                                            useEntryRoleColors
                                             resolveNodeDetail={(node) => {
                                                 const detailNode = modalContextGraph.nodes.find((candidate) => candidate.id === node.id);
                                                 if (!detailNode) return null;
@@ -1221,6 +1078,7 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                                                     id: detailNode.id,
                                                     display_name: detailNode.label,
                                                     description: detailNode.description,
+                                                    is_entry_node: detailNode.is_entry_node,
                                                     connection_count: detailNode.connection_count,
                                                     claims: detailNode.claims || [],
                                                     neighbors: detailNode.neighbors || [],
