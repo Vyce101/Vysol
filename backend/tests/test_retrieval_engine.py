@@ -371,6 +371,99 @@ def test_retrieve_context_sorts_graph_edges_by_book_then_chunk(monkeypatch):
     assert context.index(second_edge) < context.index(third_edge)
 
 
+def test_retrieve_preserves_chunk_tags_and_sorts_rag_chunks_by_book_then_chunk(monkeypatch):
+    _patch_retrieval_dependencies(
+        monkeypatch,
+        bfs_nodes=[
+            {"id": "g1", "display_name": "Node One", "description": "desc1"},
+        ],
+        graph_nodes=[
+            ("g1", {"display_name": "Node One", "description": "desc1"}),
+        ],
+        chunk_results=[
+            {
+                "id": "chunk-b2-c0",
+                "document": "[B2:C0] Later chunk",
+                "metadata": {"book_number": 2, "chunk_index": 0},
+            },
+            {
+                "id": "chunk-b1-c7",
+                "document": "[B1:C7] Earlier chunk in same book",
+                "metadata": {"book_number": 1, "chunk_index": 7},
+            },
+            {
+                "id": "chunk-b1-c0",
+                "document": "[B1:C0] Earliest chunk",
+                "metadata": {"book_number": 1, "chunk_index": 0},
+            },
+        ],
+        node_results=[{"id": "g1"}],
+        settings={
+            "retrieval_top_k_chunks": 3,
+            "retrieval_entry_top_k_nodes": 1,
+            "retrieval_graph_hops": 2,
+            "retrieval_max_nodes": 20,
+        },
+    )
+
+    engine = retrieval_engine.RetrievalEngine("world-1")
+    result = engine.retrieve("test query")
+    context = result["context_string"]
+
+    first_chunk = "[B1:C0] Earliest chunk"
+    second_chunk = "[B1:C7] Earlier chunk in same book"
+    third_chunk = "[B2:C0] Later chunk"
+
+    assert first_chunk in context
+    assert second_chunk in context
+    assert third_chunk in context
+    assert context.index(first_chunk) < context.index(second_chunk)
+    assert context.index(second_chunk) < context.index(third_chunk)
+
+
+def test_retrieve_rag_chunks_dedup_only_by_chunk_id(monkeypatch):
+    _patch_retrieval_dependencies(
+        monkeypatch,
+        bfs_nodes=[
+            {"id": "g1", "display_name": "Node One", "description": "desc1"},
+        ],
+        graph_nodes=[
+            ("g1", {"display_name": "Node One", "description": "desc1"}),
+        ],
+        chunk_results=[
+            {
+                "id": "chunk-a",
+                "document": "[B1:C0] Shared text",
+                "metadata": {"book_number": 1, "chunk_index": 0},
+            },
+            {
+                "id": "chunk-a",
+                "document": "[B1:C0] Shared text",
+                "metadata": {"book_number": 1, "chunk_index": 0},
+            },
+            {
+                "id": "chunk-b",
+                "document": "[B1:C1] Shared text",
+                "metadata": {"book_number": 1, "chunk_index": 1},
+            },
+        ],
+        node_results=[{"id": "g1"}],
+        settings={
+            "retrieval_top_k_chunks": 3,
+            "retrieval_entry_top_k_nodes": 1,
+            "retrieval_graph_hops": 2,
+            "retrieval_max_nodes": 20,
+        },
+    )
+
+    engine = retrieval_engine.RetrievalEngine("world-1")
+    result = engine.retrieve("test query")
+    context = result["context_string"]
+
+    assert context.count("[B1:C0] Shared text") == 1
+    assert context.count("[B1:C1] Shared text") == 1
+
+
 def test_retrieve_builds_context_graph_snapshot_from_real_nodes_and_sorted_edges(monkeypatch):
     _patch_retrieval_dependencies(
         monkeypatch,

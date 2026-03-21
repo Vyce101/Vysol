@@ -30,6 +30,19 @@ def _edge_temporal_sort_key(edge: dict) -> tuple[int, int]:
     return book, chunk
 
 
+def _chunk_temporal_sort_key(chunk: dict) -> tuple[int, int, int]:
+    metadata = chunk.get("metadata", {}) if isinstance(chunk, dict) else {}
+    raw_book = metadata.get("book_number", 0)
+    raw_chunk = metadata.get("chunk_index", 0)
+
+    try:
+        book = int(raw_book)
+        chunk_index = int(raw_chunk)
+        return 0, book, chunk_index
+    except (TypeError, ValueError):
+        return 1, 0, 0
+
+
 def _normalize_context_text(value: str) -> str:
     return " ".join(part.strip() for part in str(value or "").splitlines() if part.strip())
 
@@ -264,16 +277,22 @@ class RetrievalEngine:
                 edge_strs.append(self._format_context_edge_line(edge))
             parts.append("# Graph Edges\n" + "\n".join(edge_strs))
 
-        # RAG Chunks (scrubbed of B{X}:C{Y} tags and deduplicated)
+        # RAG Chunks
         if rag_chunks:
-            import re
             chunk_strs = []
-            seen_chunks = set()
-            for chunk in rag_chunks:
+            seen_chunk_ids: set[str] = set()
+            ordered_chunks = sorted(
+                enumerate(rag_chunks),
+                key=lambda item: (_chunk_temporal_sort_key(item[1]), item[0]),
+            )
+            for _, chunk in ordered_chunks:
+                chunk_id = str(chunk.get("id", "") or "")
+                if not chunk_id or chunk_id in seen_chunk_ids:
+                    continue
+
+                seen_chunk_ids.add(chunk_id)
                 doc = chunk.get("document", "")
-                doc = re.sub(r"\[B\d+:C\d+\]\s*", "", doc).strip()
-                if doc and doc not in seen_chunks:
-                    seen_chunks.add(doc)
+                if doc:
                     chunk_strs.append(doc)
             if chunk_strs:
                 parts.append("# RAG Chunks\n" + "\n\n".join(chunk_strs))

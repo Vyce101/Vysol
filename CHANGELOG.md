@@ -24,6 +24,7 @@ All notable user-visible changes to this project will be documented in this file
 - Renamed the default embedding model to `gemini-embedding-2-preview`.
 - Changed retrieval entry-node indexing to use one persistent vector per current graph node, with `Re-embed All` rebuilding from the current saved graph state.
 - Changed model-context assembly and Context X-Ray to preserve real graph nodes even when different nodes share the same display name, instead of fake-merging them by label.
+- Changed `# RAG Chunks` context assembly to keep full chunk text and `[B#:C#]` provenance tags while ordering included chunks by temporal provenance.
 
 ### Fixed
 
