@@ -26,6 +26,7 @@ interface ChatThread {
     id: string;
     title: string;
     updated_at: string;
+    version: number;
 }
 
 interface ContextModalData {
@@ -259,9 +260,15 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     const [contextModalData, setContextModalData] = useState<ContextModalData | null>(null);
     const [contextMetaOpen, setContextMetaOpen] = useState(false);
     const [contextViewMode, setContextViewMode] = useState<"rendered" | "graph" | "json">("rendered");
+    const [hoveredThreadId, setHoveredThreadId] = useState<string | null>(null);
+    const [renamingChatId, setRenamingChatId] = useState<string | null>(null);
+    const [renameDraft, setRenameDraft] = useState("");
+    const [renamingBusyChatId, setRenamingBusyChatId] = useState<string | null>(null);
 
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const messageBubbleRefs = useRef<Record<number, HTMLDivElement | null>>({});
+    const renameInputRef = useRef<HTMLInputElement | null>(null);
+    const renamingChatIdRef = useRef<string | null>(null);
 
     const createEmptyThreadState = (): ChatThreadState => ({
         messages: [],
@@ -341,6 +348,10 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     }, [chatStates]);
 
     useEffect(() => {
+        renamingChatIdRef.current = renamingChatId;
+    }, [renamingChatId]);
+
+    useEffect(() => {
         if (isAutoScrollEnabled.current) {
             messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
         }
@@ -352,6 +363,13 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
             setContextViewMode("rendered");
         }
     }, [contextModalData]);
+
+    useEffect(() => {
+        if (renamingChatId && renameInputRef.current) {
+            renameInputRef.current.focus();
+            renameInputRef.current.select();
+        }
+    }, [renamingChatId]);
 
     const handleScroll = () => {
         if (!scrollContainerRef.current) return;
@@ -416,6 +434,13 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                     version: data.version ?? 0,
                 };
             });
+            if (typeof data.version === "number") {
+                setThreads((prev) => prev.map((thread) => (
+                    thread.id === chatId
+                        ? { ...thread, version: data.version }
+                        : thread
+                )));
+            }
         } catch { /* ignore */ }
     }
 
@@ -480,6 +505,68 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
         } catch { /* ignore */ }
     };
 
+    const startRenamingChat = (thread: ChatThread) => {
+        setRenamingBusyChatId(null);
+        setRenamingChatId(thread.id);
+        setRenameDraft(thread.title);
+    };
+
+    const cancelRenamingChat = (chatId?: string) => {
+        setRenamingBusyChatId((current) => (
+            chatId === undefined || current === chatId ? null : current
+        ));
+        if (chatId === undefined || renamingChatIdRef.current === chatId) {
+            setRenamingChatId(null);
+            setRenameDraft("");
+        }
+    };
+
+    const renameChat = async (thread: ChatThread) => {
+        const nextTitle = renameDraft.trim();
+        const baseVersion = activeChatId === thread.id
+            ? (chatStatesRef.current[thread.id]?.version ?? thread.version)
+            : thread.version;
+        if (renamingBusyChatId === thread.id) return;
+        if (!nextTitle || nextTitle === thread.title.trim()) {
+            cancelRenamingChat(thread.id);
+            return;
+        }
+
+        setRenamingBusyChatId(thread.id);
+        try {
+            const renamed = await apiFetch<ChatThread>(`/worlds/${worldId}/chats/${thread.id}`, {
+                method: "PATCH",
+                body: JSON.stringify({
+                    title: nextTitle,
+                    base_version: baseVersion,
+                }),
+            });
+            setThreads((prev) => prev.map((current) => (
+                current.id === thread.id
+                    ? { ...current, title: renamed.title, version: renamed.version }
+                    : current
+            )));
+            if (activeChatId === thread.id) {
+                setThreadState(thread.id, (current) => ({
+                    ...current,
+                    version: renamed.version ?? current.version,
+                }));
+            }
+            cancelRenamingChat(thread.id);
+        } catch (err) {
+            cancelRenamingChat(thread.id);
+            await loadThreads();
+            if (activeChatId === thread.id) {
+                await loadChatDetails(thread.id);
+            }
+            if (err instanceof ApiError && err.status === 409) {
+                alert("This chat changed in another tab. Reloaded the latest chat titles instead.");
+                return;
+            }
+            alert("Failed to rename chat.");
+        }
+    };
+
     const saveRetrievalSettings = (updates: Record<string, unknown>) => {
         if (debounceRef.current) clearTimeout(debounceRef.current);
         debounceRef.current = setTimeout(() => {
@@ -511,6 +598,13 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                 messages: data.messages ? data.messages.map(mapMessage) : newMessages,
                 streaming: false,
             }));
+            if (typeof data.version === "number") {
+                setThreads((prev) => prev.map((thread) => (
+                    thread.id === chatId
+                        ? { ...thread, version: data.version }
+                        : thread
+                )));
+            }
             return true;
         } catch (err) {
             if (err instanceof ApiError && err.status === 409) {
@@ -779,6 +873,8 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                             <div 
                                 key={t.id} 
                                 onClick={() => setActiveChatId(t.id)} 
+                                onMouseEnter={() => setHoveredThreadId(t.id)}
+                                onMouseLeave={() => setHoveredThreadId((current) => (current === t.id ? null : current))}
                                 style={{ 
                                     padding: "10px 12px", 
                                     background: t.id === activeChatId ? "var(--primary-soft)" : "transparent",
@@ -790,13 +886,67 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                             >
                                 <div style={{ display: "flex", alignItems: "center", gap: 8, overflow: "hidden", flex: 1 }}>
                                     <MessageSquare size={14} style={{ color: t.id === activeChatId ? "var(--primary-light)" : "var(--text-muted)", flexShrink: 0 }} />
-                                    <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: t.id === activeChatId ? 500 : 400, color: t.id === activeChatId ? "var(--primary-light)" : "var(--text-primary)" }}>
-                                        {t.title}
-                                    </div>
+                                    {renamingChatId === t.id ? (
+                                        <input
+                                            ref={renameInputRef}
+                                            value={renameDraft}
+                                            onClick={(e) => e.stopPropagation()}
+                                            onChange={(e) => setRenameDraft(e.target.value)}
+                                            onKeyDown={(e) => {
+                                                e.stopPropagation();
+                                                if (e.key === "Enter") {
+                                                    e.preventDefault();
+                                                    void renameChat(t);
+                                                } else if (e.key === "Escape") {
+                                                    e.preventDefault();
+                                                    cancelRenamingChat();
+                                                }
+                                            }}
+                                            onBlur={() => { void renameChat(t); }}
+                                            disabled={renamingBusyChatId === t.id}
+                                            style={{
+                                                flex: 1,
+                                                minWidth: 0,
+                                                fontSize: 13,
+                                                fontWeight: t.id === activeChatId ? 500 : 400,
+                                                color: t.id === activeChatId ? "var(--primary-light)" : "var(--text-primary)",
+                                                background: "var(--card)",
+                                                border: "1px solid var(--primary)",
+                                                borderRadius: 6,
+                                                padding: "4px 8px",
+                                                outline: "none",
+                                            }}
+                                        />
+                                    ) : (
+                                        <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13, fontWeight: t.id === activeChatId ? 500 : 400, color: t.id === activeChatId ? "var(--primary-light)" : "var(--text-primary)" }}>
+                                            {t.title}
+                                        </div>
+                                    )}
                                 </div>
-                                <button onClick={(e) => { e.stopPropagation(); deleteChat(t.id); }} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", padding: 4, visibility: t.id === activeChatId ? "visible" : "hidden" }}>
-                                    <Trash2 size={13} />
-                                </button>
+                                {renamingChatId !== t.id && (
+                                    <div style={{ display: "flex", alignItems: "center", gap: 2, visibility: hoveredThreadId === t.id || t.id === activeChatId ? "visible" : "hidden" }}>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                startRenamingChat(t);
+                                            }}
+                                            title="Rename chat"
+                                            style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", padding: 4 }}
+                                        >
+                                            <Edit2 size={13} />
+                                        </button>
+                                        <button
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                deleteChat(t.id);
+                                            }}
+                                            title="Delete chat"
+                                            style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", padding: 4 }}
+                                        >
+                                            <Trash2 size={13} />
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         ))}
                         {threads.length === 0 && (

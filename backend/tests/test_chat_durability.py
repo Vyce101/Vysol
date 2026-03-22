@@ -76,6 +76,82 @@ def test_update_history_rejects_stale_base_version(monkeypatch):
     assert exc_info.value.status_code == 409
 
 
+def test_rename_chat_updates_title_preserves_updated_at_and_lists_version(monkeypatch):
+    world_id = f"world-{uuid.uuid4()}"
+    store = _make_store(monkeypatch, world_id)
+    created = store.create_chat("Original")
+    before = store.get_chat(created["id"])
+
+    renamed = asyncio.run(chat_router.rename_chat(
+        world_id,
+        created["id"],
+        chat_router.RenameChatRequest(
+            title="  Renamed Chat  ",
+            base_version=created["version"],
+        ),
+    ))
+
+    saved = store.get_chat(created["id"])
+    listed = store.list_chats()
+
+    assert renamed["title"] == "Renamed Chat"
+    assert renamed["version"] == created["version"] + 1
+    assert saved is not None
+    assert saved["title"] == "Renamed Chat"
+    assert saved["version"] == created["version"] + 1
+    assert before is not None
+    assert saved["updated_at"] == before["updated_at"]
+    assert listed[0]["id"] == created["id"]
+    assert listed[0]["version"] == saved["version"]
+    assert listed[0]["updated_at"] == before["updated_at"]
+
+
+def test_rename_chat_rejects_blank_title(monkeypatch):
+    world_id = f"world-{uuid.uuid4()}"
+    store = _make_store(monkeypatch, world_id)
+    created = store.create_chat("Original")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(chat_router.rename_chat(
+            world_id,
+            created["id"],
+            chat_router.RenameChatRequest(
+                title="   ",
+                base_version=created["version"],
+            ),
+        ))
+
+    assert exc_info.value.status_code == 400
+
+
+def test_rename_chat_rejects_stale_base_version(monkeypatch):
+    world_id = f"world-{uuid.uuid4()}"
+    store = _make_store(monkeypatch, world_id)
+    created = store.create_chat("Original")
+
+    first = asyncio.run(chat_router.rename_chat(
+        world_id,
+        created["id"],
+        chat_router.RenameChatRequest(
+            title="First Rename",
+            base_version=created["version"],
+        ),
+    ))
+    assert first["version"] == created["version"] + 1
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(chat_router.rename_chat(
+            world_id,
+            created["id"],
+            chat_router.RenameChatRequest(
+                title="Second Rename",
+                base_version=created["version"],
+            ),
+        ))
+
+    assert exc_info.value.status_code == 409
+
+
 def test_stream_reply_persists_placeholder_before_done_and_finishes_saved(monkeypatch):
     world_id = f"world-{uuid.uuid4()}"
     store = _make_store(monkeypatch, world_id)

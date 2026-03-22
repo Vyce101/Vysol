@@ -182,6 +182,7 @@ class ChatStore:
                         "title": data.get("title", "New Chat"),
                         "created_at": data.get("created_at"),
                         "updated_at": data.get("updated_at"),
+                        "version": data.get("version", 0),
                     })
             except Exception:
                 pass
@@ -221,6 +222,13 @@ class ChatStore:
         except Exception:
             return None
 
+    def _write_chat(self, path: Path, data: dict) -> dict:
+        tmp = path.with_suffix(".tmp.json")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(str(tmp), str(path))
+        return data
+
     def save_chat(self, chat_id: str, data: dict, *, expected_version: int | None = None) -> dict:
         existing = self.get_chat(chat_id)
         current_version = existing.get("version", 0) if existing else 0
@@ -235,11 +243,30 @@ class ChatStore:
         normalized["updated_at"] = now
 
         path = self._get_path(chat_id)
-        tmp = path.with_suffix(".tmp.json")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(normalized, f, indent=2)
-        os.replace(str(tmp), str(path))
-        return normalized
+        return self._write_chat(path, normalized)
+
+    def rename_chat(self, chat_id: str, title: str, *, expected_version: int | None = None) -> dict | None:
+        existing = self.get_chat(chat_id)
+        if not existing:
+            return None
+
+        normalized_title = str(title).strip()
+        if not normalized_title:
+            raise ValueError("Chat title cannot be empty.")
+
+        current_version = existing.get("version", 0)
+        if expected_version is not None and current_version != expected_version:
+            raise ChatVersionConflictError(
+                f"Chat {chat_id} has version {current_version}, expected {expected_version}."
+            )
+
+        preserved_updated_at = existing.get("updated_at", self._now_iso())
+        renamed = self._normalize_chat(existing, chat_id, now=preserved_updated_at)
+        renamed["title"] = normalized_title
+        renamed["version"] = current_version + 1
+        renamed["updated_at"] = preserved_updated_at
+
+        return self._write_chat(self._get_path(chat_id), renamed)
 
     def delete_chat(self, chat_id: str) -> bool:
         path = self._get_path(chat_id)

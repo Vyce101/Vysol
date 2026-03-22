@@ -15,6 +15,7 @@ All notable user-visible changes to this project will be documented in this file
 - Added the VySol browser/header branding icon using the square logo asset.
 - Added a per-message `Context Graph` view in Context X-Ray for newer chat messages.
 - Added a Safety Review Queue for extraction safety blocks, including one-shot recovery for already-collapsed blocked chunks and in-app chunk editing/testing.
+- Added inline chat renaming in the sidebar, with conflict-safe saves that preserve Recent ordering.
 
 ### Changed
 

@@ -21,6 +21,10 @@ class ChatRequest(BaseModel):
 class CreateChatRequest(BaseModel):
     title: str = "New Chat"
 
+class RenameChatRequest(BaseModel):
+    title: str
+    base_version: int
+
 class UpdateChatHistoryRequest(BaseModel):
     messages: list[dict]
     base_version: int
@@ -120,6 +124,25 @@ async def get_chat(world_id: str, chat_id: str):
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat
+
+@router.patch("/{world_id}/chats/{chat_id}")
+async def rename_chat(world_id: str, chat_id: str, req: RenameChatRequest):
+    store = ChatStore(world_id)
+    try:
+        renamed = store.rename_chat(chat_id, req.title, expected_version=req.base_version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ChatVersionConflictError:
+        raise HTTPException(status_code=409, detail="This chat changed in another tab. Reload the chat list and try again.")
+    if not renamed:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return {
+        "id": renamed["id"],
+        "title": renamed["title"],
+        "created_at": renamed["created_at"],
+        "updated_at": renamed["updated_at"],
+        "version": renamed["version"],
+    }
 
 @router.delete("/{world_id}/chats/{chat_id}")
 async def delete_chat(world_id: str, chat_id: str):
