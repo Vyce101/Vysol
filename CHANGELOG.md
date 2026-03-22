@@ -21,6 +21,7 @@ All notable user-visible changes to this project will be documented in this file
 
 - Refreshed docs and aligned runtime defaults.
 - Corrected project branding capitalization to `VySol`.
+- Refined the README positioning and added a `Common Uses` section to present roleplay in pre-existing fictional worlds as VySol's personal origin while broadening the documented use cases.
 - Documented entity resolution run modes.
 - Documented API key toggle behavior in the walkthrough and Google AI Studio key guide.
 - Renamed the default embedding model to `gemini-embedding-2-preview`.

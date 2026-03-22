@@ -24,7 +24,7 @@ This project is licensed under the GNU AGPLv3. Companies requiring a commercial 
 
 ## What This Project Is
 
-VySol is meant to be a graph RAG app that is easy to use, easy to set up, and flexible enough for people who want control over how their graph is made.
+VySol was personally developed for roleplay in pre-existing fictional worlds, but it is designed to be useful anywhere local-first graph RAG is helpful.
 
 It gives you one place to:
 
@@ -36,6 +36,18 @@ It gives you one place to:
 - Chat against chunk retrieval and graph context together
 - Trace every graph edge back to its source document and chunk, useful for chronological documents
 - Inspect exactly what context was sent for every chat message with Context X-Ray
+
+## Common Uses
+
+- Roleplay in pre-existing fictional worlds
+- Anyone who wants easy-to-use, fast-setup local-first graph RAG for their own corpus or workflow
+- Original worldbuilding and lore management
+- Continuity checking across long-running stories or document sets
+- Personal knowledge bases with traceable source grounding
+- Studying large document collections with graph-backed chat
+- Organizing technical documentation and internal knowledge
+- Investigating timelines and connections across archival or reference material
+- Inspectable local-first RAG over private text corpora
 
 ## Where To Read Next
 
