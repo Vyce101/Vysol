@@ -445,17 +445,18 @@ def _safety_review_summary_from_reviews(reviews: list[dict]) -> dict:
         if blocking_unresolved_reviews > 0 and blocking_active_override_reviews > 0:
             blocking_message = (
                 "Safety review work is still pending and this world also has active repaired-chunk overrides. "
-                "Resolve or discard the review queue before running Start Over, Rechunk And Re-ingest, or Re-embed All."
+                "Resolve or discard the review queue before running Start Over, Re-ingest With Previous Settings, "
+                "or Rechunk And Re-ingest."
             )
         elif blocking_unresolved_reviews > 0:
             blocking_message = (
                 "This world has unresolved safety review items. Resolve or discard them before running Start Over, "
-                "Rechunk And Re-ingest, or Re-embed All."
+                "Re-ingest With Previous Settings, or Rechunk And Re-ingest."
             )
         else:
             blocking_message = (
                 "This world has active repaired-chunk overrides. Discard those overrides before running Start Over, "
-                "Rechunk And Re-ingest, or Re-embed All, or the rebuild would lose the repaired chunk text."
+                "Re-ingest With Previous Settings, or Rechunk And Re-ingest, or the rebuild would lose the repaired chunk text."
             )
 
     return {
@@ -649,6 +650,10 @@ def _review_baseline_raw_text(review: dict) -> str:
     return _normalize_review_text(review.get("original_raw_text"))
 
 
+def _review_overlap_raw_text(review: dict) -> str:
+    return _normalize_review_text(review.get("overlap_raw_text"))
+
+
 def _review_editor_raw_text(review: dict) -> str:
     draft_raw_text = _normalize_review_text(review.get("draft_raw_text"))
     if draft_raw_text.strip():
@@ -666,6 +671,11 @@ def _set_review_pending_status(review: dict) -> bool:
     original_prefixed_text = _normalize_review_text(review.get("original_prefixed_text"))
     if review.get("original_prefixed_text") != original_prefixed_text:
         review["original_prefixed_text"] = original_prefixed_text
+        changed = True
+
+    overlap_raw_text = _review_overlap_raw_text(review)
+    if review.get("overlap_raw_text") != overlap_raw_text:
+        review["overlap_raw_text"] = overlap_raw_text
         changed = True
 
     active_override_raw_text = _normalize_review_text(review.get("active_override_raw_text"))
@@ -790,6 +800,57 @@ def _build_prefixed_chunk_text(book_number: int, chunk_index: int, raw_text: str
     return f"[B{book_number}:C{chunk_index}] {raw_text}"
 
 
+def _combine_chunk_raw_text(overlap_text: str, primary_text: str) -> str:
+    normalized_overlap = _normalize_review_text(overlap_text).strip()
+    normalized_primary = _normalize_review_text(primary_text).strip()
+    if normalized_overlap and normalized_primary:
+        return f"{normalized_overlap} {normalized_primary}"
+    return normalized_overlap or normalized_primary
+
+
+def _build_chunk_prefixed_text(book_number: int, chunk_index: int, overlap_text: str, primary_text: str) -> str:
+    return _build_prefixed_chunk_text(
+        book_number,
+        chunk_index,
+        _combine_chunk_raw_text(overlap_text, primary_text),
+    )
+
+
+def _build_graph_extraction_payload(primary_text: str, overlap_text: str = "") -> str:
+    normalized_primary = _normalize_review_text(primary_text).strip()
+    normalized_overlap = _normalize_review_text(overlap_text).strip()
+    if not normalized_overlap:
+        return normalized_primary
+    return (
+        "Chunk body to extract from:\n"
+        f"{normalized_primary}\n\n"
+        "Reference-only overlap context from the previous chunk:\n"
+        f"{normalized_overlap}\n\n"
+        "Use the overlap context only to resolve references inside the chunk body. "
+        "Do not extract entities or relationships that appear only in the overlap context."
+    )
+
+
+def _build_graph_extraction_payload_for_chunk(chunk: TemporalChunk) -> str:
+    return _build_graph_extraction_payload(chunk.primary_text, chunk.overlap_text)
+
+
+def _replace_temporal_chunk_body(chunk: TemporalChunk, primary_text: str) -> TemporalChunk:
+    combined_raw_text = _combine_chunk_raw_text(chunk.overlap_text, primary_text)
+    return chunk.model_copy(
+        update={
+            "primary_text": _normalize_review_text(primary_text),
+            "raw_text": combined_raw_text,
+            "prefixed_text": _build_chunk_prefixed_text(
+                chunk.book_number,
+                chunk.chunk_index,
+                chunk.overlap_text,
+                primary_text,
+            ),
+        }
+    )
+
+
 def _classify_exception_kind(exc: Exception) -> str:
     if isinstance(exc, ExtractionCoverageError):
         return "no_extraction_coverage"
@@ -858,6 +919,7 @@ def _upsert_safety_review(
     original_raw_text: str,
     original_prefixed_text: str,
     safety_reason: str,
+    overlap_raw_text: str = "",
     original_error_kind: str = "safety_block",
     review_origin: str = "safety_block",
     manual_rescue_fingerprint: dict | None = None,
@@ -879,8 +941,9 @@ def _upsert_safety_review(
             "status": "blocked",
             "original_error_kind": original_error_kind,
             "original_safety_reason": safety_reason,
-            "original_raw_text": original_raw_text,
-            "original_prefixed_text": original_prefixed_text,
+            "original_raw_text": _normalize_review_text(original_raw_text),
+            "original_prefixed_text": _normalize_review_text(original_prefixed_text),
+            "overlap_raw_text": _normalize_review_text(overlap_raw_text),
             "review_origin": review_origin,
             "manual_rescue_fingerprint": manual_rescue_fingerprint if isinstance(manual_rescue_fingerprint, dict) else None,
             "draft_raw_text": _normalize_review_text(original_raw_text),
@@ -907,6 +970,8 @@ def _upsert_safety_review(
             review["original_raw_text"] = _normalize_review_text(original_raw_text)
         if not _normalize_review_text(review.get("original_prefixed_text")).strip():
             review["original_prefixed_text"] = _normalize_review_text(original_prefixed_text)
+        if "overlap_raw_text" in review:
+            review["overlap_raw_text"] = _normalize_review_text(overlap_raw_text)
         review["review_origin"] = review_origin
         review["manual_rescue_fingerprint"] = manual_rescue_fingerprint if isinstance(manual_rescue_fingerprint, dict) else None
         if review.get("test_in_progress") is None:
@@ -954,14 +1019,7 @@ def _apply_active_chunk_overrides(
         if not override_text:
             updated_chunks.append(chunk)
             continue
-        updated_chunks.append(
-            chunk.model_copy(
-                update={
-                    "raw_text": override_text,
-                    "prefixed_text": _build_prefixed_chunk_text(chunk.book_number, chunk.chunk_index, override_text),
-                }
-            )
-        )
+        updated_chunks.append(_replace_temporal_chunk_body(chunk, override_text))
     return updated_chunks
 
 
@@ -1473,6 +1531,8 @@ def _load_source_temporal_chunks(
         chunks=[
             {
                 "text": chunk.text,
+                "primary_text": chunk.primary_text,
+                "overlap_text": chunk.overlap_text,
                 "char_start": chunk.char_start,
                 "char_end": chunk.char_end,
                 "index": chunk.index,
@@ -1504,12 +1564,14 @@ def get_reembed_eligibility(
     meta: dict | None = None,
     audit_summary: dict | None = None,
 ) -> dict:
-    review_guard = get_safety_review_rebuild_guard(world_id)
-    if not review_guard.get("can_rebuild"):
+    review_summary = get_safety_review_summary(world_id)
+    if int(review_summary.get("unresolved_reviews", 0) or 0) > 0:
         return {
             "can_reembed_all": False,
             "reason_code": "safety_review_pending",
-            "message": str(review_guard.get("message") or "Safety review work is still pending for this world."),
+            "message": (
+                "This world has unresolved safety review items. Resolve or discard them before running Re-embed All."
+            ),
             "ignored_pending_sources_count": 0,
             "requires_full_rebuild": False,
             "eligible_source_ids": [],
@@ -2358,7 +2420,8 @@ async def start_ingestion(
                             ),
                         },
                     )
-                    ga_output, ga_usage = await ga.run(tc.prefixed_text)
+                    extraction_payload = _build_graph_extraction_payload_for_chunk(tc)
+                    ga_output, ga_usage = await ga.run(extraction_payload)
                     _ensure_not_aborted(world_id, my_event)
                     final_nodes = list(ga_output.nodes)
                     final_edges = list(ga_output.edges)
@@ -2383,7 +2446,7 @@ async def start_ingestion(
                                 ),
                             },
                         )
-                        glean_out, _ = await ga.run_glean(tc.prefixed_text, final_nodes, final_edges)
+                        glean_out, _ = await ga.run_glean(extraction_payload, final_nodes, final_edges)
                         _ensure_not_aborted(world_id, my_event)
                         final_nodes.extend(glean_out.nodes)
                         final_edges.extend(glean_out.edges)
@@ -2470,8 +2533,9 @@ async def start_ingestion(
                                 book_number=book_number,
                                 chunk_index=chunk_idx,
                                 chunk_id=chunk,
-                                original_raw_text=tc.raw_text,
+                                original_raw_text=tc.primary_text,
                                 original_prefixed_text=tc.prefixed_text,
+                                overlap_raw_text=tc.overlap_text,
                                 safety_reason=str(safety_reason or err_text),
                             )
                         _mark_ingestion_live(meta, operation=operation_norm)
@@ -3089,8 +3153,9 @@ async def manual_rescue_safety_reviews(
                 book_number=int(source.get("book_number") or 0),
                 chunk_index=chunk_index,
                 chunk_id=chunk_id,
-                original_raw_text=temporal_chunk.raw_text,
+                original_raw_text=temporal_chunk.primary_text,
                 original_prefixed_text=temporal_chunk.prefixed_text,
+                overlap_raw_text=temporal_chunk.overlap_text,
                 safety_reason=(
                     "Manual rescue for the current extraction failure: "
                     f"{failure.get('error_type', 'unknown')} - {failure.get('error_message', 'Unknown error.')}"
@@ -3202,12 +3267,7 @@ async def test_safety_review(world_id: str, review_id: str) -> dict:
         )
 
     base_chunk = temporal_chunks[chunk_index]
-    test_chunk = base_chunk.model_copy(
-        update={
-            "raw_text": candidate_raw_text,
-            "prefixed_text": _build_prefixed_chunk_text(book_number, chunk_index, candidate_raw_text),
-        }
-    )
+    test_chunk = _replace_temporal_chunk_body(base_chunk, candidate_raw_text)
 
     graph_store = GraphStore(world_id)
     vector_store = VectorStore(world_id, embedding_model=world_ingest_settings["embedding_model"])
@@ -3249,13 +3309,14 @@ async def test_safety_review(world_id: str, review_id: str) -> dict:
     dummy_abort_event = threading.Event()
     try:
         extraction_slot = await _extraction_scheduler.acquire(dummy_abort_event)
-        ga_output, _ = await ga.run(test_chunk.prefixed_text)
+        extraction_payload = _build_graph_extraction_payload_for_chunk(test_chunk)
+        ga_output, _ = await ga.run(extraction_payload)
         final_nodes = list(ga_output.nodes)
         final_edges = list(ga_output.edges)
 
         glean_amount = int(settings.get("glean_amount", 1))
         for _ in range(max(0, glean_amount)):
-            glean_out, _ = await ga.run_glean(test_chunk.prefixed_text, final_nodes, final_edges)
+            glean_out, _ = await ga.run_glean(extraction_payload, final_nodes, final_edges)
             final_nodes.extend(glean_out.nodes)
             final_edges.extend(glean_out.edges)
     except Exception as exc:

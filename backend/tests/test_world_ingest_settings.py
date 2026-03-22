@@ -5,6 +5,8 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 
 from core import config, entity_text, ingestion_engine
+from core.chunker import RecursiveChunker
+from core.temporal_indexer import stamp_chunks
 from routers import ingestion as ingestion_router
 
 
@@ -295,6 +297,151 @@ def test_manual_rescue_active_overrides_still_block_reembed():
     assert summary["active_override_reviews"] == 1
     assert summary["blocks_rebuild"] is True
     assert "active repaired-chunk overrides" in summary["blocking_message"]
+
+
+def test_get_reembed_eligibility_allows_resolved_active_overrides(monkeypatch):
+    meta = {
+        "world_id": "world-1",
+        "ingestion_status": "complete",
+        "ingest_settings": {
+            "chunk_size_chars": 4000,
+            "chunk_overlap_chars": 150,
+            "embedding_model": "embed-model",
+            "locked_at": "2026-03-20T00:00:00+00:00",
+            "last_ingest_settings_at": "2026-03-20T00:00:00+00:00",
+        },
+        "sources": [
+            {
+                "source_id": "source-a",
+                "display_name": "Book 1",
+                "status": "complete",
+                "chunk_count": 12,
+                "ingested_at": "2026-03-20T00:00:00+00:00",
+                "ingest_snapshot": {
+                    "vault_filename": "book_1.txt",
+                    "file_size": 123,
+                    "file_sha256": "abc",
+                    "chunk_size_chars": 4000,
+                    "chunk_overlap_chars": 150,
+                    "embedding_model": "embed-model",
+                },
+            }
+        ],
+    }
+    audit_summary = {
+        "sources": [
+            {"source_id": "source-a", "failed_records": 0},
+        ]
+    }
+
+    monkeypatch.setattr(
+        ingestion_engine,
+        "get_safety_review_summary",
+        lambda world_id: {
+            "unresolved_reviews": 0,
+            "resolved_reviews": 1,
+            "active_override_reviews": 1,
+            "blocks_rebuild": True,
+            "blocking_message": "Active repaired chunks still block full rebuilds.",
+        },
+    )
+    monkeypatch.setattr(
+        ingestion_engine,
+        "_build_source_ingest_snapshot",
+        lambda world_id, source, ingest_settings: dict(source["ingest_snapshot"]),
+    )
+
+    eligibility = ingestion_engine.get_reembed_eligibility("world-1", meta=meta, audit_summary=audit_summary)
+
+    assert eligibility["can_reembed_all"] is True
+    assert eligibility["eligible_source_ids"] == ["source-a"]
+
+
+def test_set_review_pending_status_backfills_missing_overlap_for_legacy_reviews():
+    review = {
+        "original_raw_text": "body only",
+        "original_prefixed_text": "[B1:C0] body only",
+        "draft_raw_text": "body only",
+        "active_override_raw_text": "",
+        "test_in_progress": False,
+        "status": "blocked",
+    }
+
+    changed = ingestion_engine._set_review_pending_status(review)
+
+    assert changed is True
+    assert review["overlap_raw_text"] == ""
+    assert review["status"] == "blocked"
+
+
+def test_chunk_overlap_metadata_survives_stamp_and_extraction_payload():
+    chunks = RecursiveChunker(chunk_size=8, overlap=3).chunk("alpha beta gamma")
+
+    assert len(chunks) == 3
+    assert chunks[0].primary_text == "alpha"
+    assert chunks[0].overlap_text == ""
+    assert chunks[1].primary_text == "beta"
+    assert chunks[1].overlap_text == "pha"
+    assert chunks[1].text == "pha beta"
+
+    stamped = stamp_chunks(
+        chunks=[
+            {
+                "text": chunk.text,
+                "primary_text": chunk.primary_text,
+                "overlap_text": chunk.overlap_text,
+                "char_start": chunk.char_start,
+                "char_end": chunk.char_end,
+                "index": chunk.index,
+            }
+            for chunk in chunks
+        ],
+        book_number=1,
+        source_id="source-a",
+        world_id="world-1",
+    )
+
+    assert stamped[1].raw_text == "pha beta"
+    assert stamped[1].primary_text == "beta"
+    assert stamped[1].overlap_text == "pha"
+    assert stamped[1].prefixed_text == "[B1:C1] pha beta"
+
+    payload = ingestion_engine._build_graph_extraction_payload_for_chunk(stamped[1])
+    assert "[B1:C1]" not in payload
+    assert "Chunk body to extract from:\nbeta" in payload
+    assert "Reference-only overlap context" in payload
+    assert "pha" in payload
+
+
+def test_apply_active_chunk_overrides_recombines_overlap_with_body(monkeypatch):
+    chunk = stamp_chunks(
+        chunks=[
+            {
+                "text": "pha beta",
+                "primary_text": "beta",
+                "overlap_text": "pha",
+                "char_start": 0,
+                "char_end": 8,
+                "index": 1,
+            }
+        ],
+        book_number=1,
+        source_id="source-a",
+        world_id="world-1",
+    )[0]
+
+    monkeypatch.setattr(
+        ingestion_engine,
+        "_get_active_override_map",
+        lambda world_id: {"chunk_world-1_source-a_1": "edited body"},
+    )
+
+    updated = ingestion_engine._apply_active_chunk_overrides("world-1", [chunk])[0]
+
+    assert updated.primary_text == "edited body"
+    assert updated.overlap_text == "pha"
+    assert updated.raw_text == "pha edited body"
+    assert updated.prefixed_text == "[B1:C1] pha edited body"
 
 
 def test_reembed_endpoint_rejects_when_chunk_settings_differ_from_locked_settings(monkeypatch):

@@ -11,6 +11,8 @@
 7. Start ingestion and wait until it shows complete.
 8. Open chat and ask a question.
 
+After ingestion, you can optionally run Entity Resolution with either `Exact only` or `Exact + chooser/combiner`, and tune its unique-node embedding batch and delay controls per run.
+
 API key note:
 
 - Limits are tied to project context.

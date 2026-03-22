@@ -29,6 +29,10 @@ All notable user-visible changes to this project will be documented in this file
 - Changed graph node sizing and force spacing so high-connection nodes scale larger and crowded hubs spread farther apart in the graph viewers.
 - Changed ingestion rebuild controls so `Re-embed All` now verifies the original ingested source set, ignores brand-new pending sources, and blocks when older ingested files changed or need a clean rebuild.
 - Changed safety-review editing to use one editable `Raw Chunk` field with immutable original text, repeatable test/reset flows, and clearer rebuild guards around repaired chunk overrides.
+- Changed graph extraction to use chunk-body text plus separate reference-only overlap context, while keeping prefixed combined chunk text for embeddings, chat provenance, and storage.
+- Changed safety-review editing to show overlap separately from the editable chunk body and exposed a dedicated Graph Architect glean prompt in the prompt editor.
+- Changed `Re-embed All` to reuse active repaired chunk bodies when the locked ingest snapshot still matches, while full rebuild paths remain blocked until overrides are discarded.
+- Changed entity resolution to expose per-run unique-node embedding batch and delay controls in the UI.
 
 ### Fixed
 
@@ -41,6 +45,7 @@ All notable user-visible changes to this project will be documented in this file
 - Fixed Context Graph role visibility by explicitly labeling entry nodes versus expanded nodes in the graph legend, tooltips, and inspector.
 - Fixed chunk extraction edge binding so newly extracted edges attach to the exact node UUIDs created for that chunk instead of an older same-name node elsewhere in the graph.
 - Fixed safety-block retry handling so blocked chunks stay in the safety-review flow, retries do not collapse them into fake extraction success, and stale review popups/testing states recover cleanly.
+- Fixed chat thread switching so in-flight replies and history versions stay isolated to the correct chat tab instead of leaking across chats.
 
 ### Removed
 

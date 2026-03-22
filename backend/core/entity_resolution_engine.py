@@ -28,12 +28,27 @@ _state_locks: dict[str, threading.Lock] = {}
 _active_runs: set[str] = set()
 _STALE_RUN_GRACE_SECONDS = 15
 _UNIQUE_NODE_REBUILD_BATCH_SIZE = 32
+_UNIQUE_NODE_REBUILD_COOLDOWN_SECONDS = 0.0
 
 EntityResolutionMode = Literal["exact_only", "exact_then_ai", "ai_only"]
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_embedding_batch_size(value: Any) -> int:
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return _UNIQUE_NODE_REBUILD_BATCH_SIZE
+
+
+def _normalize_embedding_cooldown_seconds(value: Any) -> float:
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return _UNIQUE_NODE_REBUILD_COOLDOWN_SECONDS
 
 
 def resolve_entity_resolution_mode(
@@ -158,6 +173,12 @@ def get_resolution_status(world_id: str) -> dict[str, Any]:
         "message": meta.get("entity_resolution_message"),
         "reason": meta.get("entity_resolution_reason"),
         "top_k": meta.get("entity_resolution_top_k", settings.get("entity_resolution_top_k", 50)),
+        "embedding_batch_size": _normalize_embedding_batch_size(
+            meta.get("entity_resolution_embedding_batch_size", _UNIQUE_NODE_REBUILD_BATCH_SIZE)
+        ),
+        "embedding_cooldown_seconds": _normalize_embedding_cooldown_seconds(
+            meta.get("entity_resolution_embedding_cooldown_seconds", _UNIQUE_NODE_REBUILD_COOLDOWN_SECONDS)
+        ),
         "resolved_entities": meta.get("entity_resolution_resolved_entities", 0),
         "unresolved_entities": meta.get("entity_resolution_unresolved_entities", 0),
         "auto_resolved_pairs": meta.get("entity_resolution_auto_resolved_pairs", 0),
@@ -187,11 +208,15 @@ def begin_entity_resolution_run(
     review_mode: bool,
     include_normalized_exact_pass: bool,
     resolution_mode: EntityResolutionMode,
+    embedding_batch_size: int | None = None,
+    embedding_cooldown_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Mark a run as active immediately so status checks don't race the background task."""
     clear_sse_queue(world_id)
     _abort_events[world_id] = threading.Event()
     _active_runs.add(world_id)
+    normalized_embedding_batch_size = _normalize_embedding_batch_size(embedding_batch_size)
+    normalized_embedding_cooldown_seconds = _normalize_embedding_cooldown_seconds(embedding_cooldown_seconds)
     state = _set_state(
         world_id,
         status="in_progress",
@@ -199,6 +224,8 @@ def begin_entity_resolution_run(
         message="Preparing entity resolution.",
         reason=None,
         top_k=top_k,
+        embedding_batch_size=normalized_embedding_batch_size,
+        embedding_cooldown_seconds=normalized_embedding_cooldown_seconds,
         resolution_mode=resolution_mode,
         review_mode=review_mode,
         include_normalized_exact_pass=_mode_uses_exact_pass(resolution_mode),
@@ -310,9 +337,20 @@ def _get_unique_node_vector_store(world_id: str) -> VectorStore:
     return VectorStore(world_id, collection_suffix="unique_nodes")
 
 
-def _upsert_unique_node_snapshots(
+async def _sleep_with_abort(expected_event: threading.Event, seconds: float) -> None:
+    if seconds <= 0:
+        return
+    aborted = await asyncio.to_thread(expected_event.wait, seconds)
+    if aborted:
+        raise asyncio.CancelledError()
+
+
+async def _upsert_unique_node_snapshots(
     unique_node_vector_store: VectorStore,
     node_snapshots: list[dict[str, Any]],
+    batch_size: int,
+    cooldown_seconds: float,
+    abort_event: threading.Event | None = None,
 ) -> int:
     normalized_nodes: list[dict[str, Any]] = []
     seen_node_ids: set[str] = set()
@@ -328,8 +366,12 @@ def _upsert_unique_node_snapshots(
 
     api_key = _get_embedding_api_key()
     total_written = 0
-    for start in range(0, len(normalized_nodes), _UNIQUE_NODE_REBUILD_BATCH_SIZE):
-        batch = normalized_nodes[start:start + _UNIQUE_NODE_REBUILD_BATCH_SIZE]
+    normalized_batch_size = _normalize_embedding_batch_size(batch_size)
+    normalized_cooldown_seconds = _normalize_embedding_cooldown_seconds(cooldown_seconds)
+    for start in range(0, len(normalized_nodes), normalized_batch_size):
+        if abort_event is not None and abort_event.is_set():
+            raise asyncio.CancelledError()
+        batch = normalized_nodes[start:start + normalized_batch_size]
         texts = [_entity_document(node) for node in batch]
         embeddings = unique_node_vector_store.embed_texts(texts, api_key)
         unique_node_vector_store.upsert_documents_embeddings(
@@ -339,12 +381,18 @@ def _upsert_unique_node_snapshots(
             embeddings=embeddings,
         )
         total_written += len(batch)
+        has_more_batches = start + normalized_batch_size < len(normalized_nodes)
+        if abort_event is not None and has_more_batches:
+            await _sleep_with_abort(abort_event, normalized_cooldown_seconds)
     return total_written
 
 
-def _rebuild_unique_node_index(
+async def _rebuild_unique_node_index(
     world_id: str,
     graph_store: GraphStore,
+    batch_size: int,
+    cooldown_seconds: float,
+    abort_event: threading.Event | None = None,
 ) -> VectorStore:
     unique_node_vector_store = _get_unique_node_vector_store(world_id)
     unique_node_vector_store.drop_collection()
@@ -354,20 +402,35 @@ def _rebuild_unique_node_index(
         for node in (_node_snapshot(graph_store, node_id) for node_id in sorted(graph_store.graph.nodes()))
         if node
     ]
-    _upsert_unique_node_snapshots(unique_node_vector_store, node_snapshots)
+    await _upsert_unique_node_snapshots(
+        unique_node_vector_store,
+        node_snapshots,
+        batch_size=batch_size,
+        cooldown_seconds=cooldown_seconds,
+        abort_event=abort_event,
+    )
     return unique_node_vector_store
 
 
-def _refresh_unique_node_index_after_merge(
+async def _refresh_unique_node_index_after_merge(
     unique_node_vector_store: VectorStore,
     graph_store: GraphStore,
     winner_id: str,
     loser_ids: list[str],
+    batch_size: int,
+    cooldown_seconds: float,
+    abort_event: threading.Event | None = None,
 ) -> None:
     unique_node_vector_store.delete_documents(loser_ids)
     winner = _node_snapshot(graph_store, winner_id)
     if winner:
-        _upsert_unique_node_snapshots(unique_node_vector_store, [winner])
+        await _upsert_unique_node_snapshots(
+            unique_node_vector_store,
+            [winner],
+            batch_size=batch_size,
+            cooldown_seconds=cooldown_seconds,
+            abort_event=abort_event,
+        )
     else:
         unique_node_vector_store.delete_document(winner_id)
 
@@ -553,6 +616,12 @@ def _update_meta_from_state(world_id: str, state: dict[str, Any], graph_store: G
     meta["entity_resolution_message"] = state.get("message")
     meta["entity_resolution_reason"] = state.get("reason")
     meta["entity_resolution_top_k"] = state.get("top_k")
+    meta["entity_resolution_embedding_batch_size"] = _normalize_embedding_batch_size(
+        state.get("embedding_batch_size", _UNIQUE_NODE_REBUILD_BATCH_SIZE)
+    )
+    meta["entity_resolution_embedding_cooldown_seconds"] = _normalize_embedding_cooldown_seconds(
+        state.get("embedding_cooldown_seconds", _UNIQUE_NODE_REBUILD_COOLDOWN_SECONDS)
+    )
     meta["entity_resolution_total_entities"] = state.get("total_entities", 0)
     meta["entity_resolution_resolved_entities"] = state.get("resolved_entities", 0)
     meta["entity_resolution_unresolved_entities"] = state.get("unresolved_entities", 0)
@@ -573,6 +642,8 @@ async def start_entity_resolution(
     review_mode: bool,
     include_normalized_exact_pass: bool,
     resolution_mode: EntityResolutionMode,
+    embedding_batch_size: int | None = None,
+    embedding_cooldown_seconds: float | None = None,
 ) -> None:
     abort_event = _abort_events.get(world_id)
     if abort_event is None:
@@ -587,6 +658,8 @@ async def start_entity_resolution(
         resolution_mode,
         include_normalized_exact_pass,
     )
+    normalized_embedding_batch_size = _normalize_embedding_batch_size(embedding_batch_size)
+    normalized_embedding_cooldown_seconds = _normalize_embedding_cooldown_seconds(embedding_cooldown_seconds)
     include_exact_pass = _mode_uses_exact_pass(normalized_resolution_mode)
     use_ai_pass = _mode_uses_ai_pass(normalized_resolution_mode)
 
@@ -597,6 +670,8 @@ async def start_entity_resolution(
         message="Preparing entity resolution.",
         reason=None,
         top_k=top_k,
+        embedding_batch_size=normalized_embedding_batch_size,
+        embedding_cooldown_seconds=normalized_embedding_cooldown_seconds,
         resolution_mode=normalized_resolution_mode,
         review_mode=review_mode,
         include_normalized_exact_pass=include_exact_pass,
@@ -686,7 +761,13 @@ async def start_entity_resolution(
             )
             _update_meta_from_state(world_id, state, graph_store)
             push_sse_event(world_id, {"event": "progress", **state})
-            unique_node_vector_store = _rebuild_unique_node_index(world_id, graph_store)
+            unique_node_vector_store = await _rebuild_unique_node_index(
+                world_id,
+                graph_store,
+                batch_size=normalized_embedding_batch_size,
+                cooldown_seconds=normalized_embedding_cooldown_seconds,
+                abort_event=abort_event,
+            )
 
         if not use_ai_pass:
             state = _set_state(
@@ -716,7 +797,13 @@ async def start_entity_resolution(
             )
             _update_meta_from_state(world_id, state, graph_store)
             push_sse_event(world_id, {"event": "progress", **state})
-            unique_node_vector_store = _rebuild_unique_node_index(world_id, graph_store)
+            unique_node_vector_store = await _rebuild_unique_node_index(
+                world_id,
+                graph_store,
+                batch_size=normalized_embedding_batch_size,
+                cooldown_seconds=normalized_embedding_cooldown_seconds,
+                abort_event=abort_event,
+            )
 
         while remaining_ids:
             _ensure_not_aborted(world_id, abort_event)
@@ -791,7 +878,15 @@ async def start_entity_resolution(
                 display_name, description = await _combine_entities(nodes)
                 _merge_group(graph_store, anchor_id, chosen_ids, display_name, description)
                 graph_store.save()
-                _refresh_unique_node_index_after_merge(unique_node_vector_store, graph_store, anchor_id, chosen_ids)
+                await _refresh_unique_node_index_after_merge(
+                    unique_node_vector_store,
+                    graph_store,
+                    anchor_id,
+                    chosen_ids,
+                    batch_size=normalized_embedding_batch_size,
+                    cooldown_seconds=normalized_embedding_cooldown_seconds,
+                    abort_event=abort_event,
+                )
 
                 processed_count += len(group_ids)
                 remaining_ids = [node_id for node_id in remaining_ids if node_id not in group_ids]

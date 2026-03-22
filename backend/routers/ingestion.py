@@ -70,7 +70,7 @@ async def ingest_start(world_id: str, req: IngestStartRequest, bg: BackgroundTas
     if has_active_ingestion_run(world_id) and meta.get("ingestion_status") == "in_progress":
         raise HTTPException(status_code=409, detail="Ingestion already in progress.")
 
-    if operation in {"rechunk_reingest", "reembed_all"} or (operation == "default" and not req.resume):
+    if operation == "rechunk_reingest" or (operation == "default" and not req.resume):
         review_guard = get_safety_review_rebuild_guard(world_id)
         if not review_guard.get("can_rebuild"):
             raise HTTPException(

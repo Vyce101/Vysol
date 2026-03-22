@@ -43,6 +43,8 @@ Important behavior:
 - Exact-only runs never enter candidate search, chooser, or combiner phases
 - Exact + chooser/combiner runs still preserve temporal graph edges while merging entities
 - Older data that predates the new run-mode field still maps safely to the previous behavior
+- Every run now also exposes unique-node embedding batch and delay controls for the index rebuild step used by entity resolution
+- Those embedding controls affect only entity resolution's unique-node rebuild path, not chooser/combiner model calls and not normal ingestion
 
 ## Context X-Ray
 
@@ -99,6 +101,7 @@ Important behavior:
 - `Re-embed All` only runs against sources that were already fully ingested in the current world
 - Newly added pending sources are ignored by `Re-embed All`; use `Resume` to ingest those
 - `Re-embed All` is blocked if a previously ingested source is missing, changed, partially ingested, failed, or comes from an older world that predates stored source snapshots
+- `Re-embed All` reuses active repaired chunk bodies when the locked source snapshot and chunk map still match, so repaired text stays aligned with rebuilt vectors
 - When that happens, the UI points you to either `Retry`, `Resume`, `Re-ingest With Previous Settings`, or `Rechunk And Re-ingest` depending on what changed
 - `Re-ingest With Previous Settings` gives you a clean full rebuild path that reuses the world's locked prior chunk settings instead of the current draft values shown in the form
 
@@ -110,13 +113,24 @@ Important behavior:
 
 - Safety-blocked chunks warn in the live ingest log as soon as they are detected
 - The queue groups blocked chunks by source and keeps the original source text separate from your editable repair draft
-- Each item shows a read-only provenance prefix plus one editable `Raw Chunk` field
+- Each item shows a read-only provenance prefix, a read-only overlap box when present, and one editable chunk-body field
 - `Reset` always restores the original source chunk, not your last attempted edit
 - A chunk is only considered repaired after extraction coverage and embedding both succeed for that edited chunk
 - If a retest fails for another reason, such as a rate limit or provider error, the chunk stays unresolved instead of being treated as fixed
 - Retry actions skip unresolved safety-review chunks so they do not silently fall back to original source text
 - Manual one-shot recovery for already-collapsed blocked chunks is world-local and temporary; it only exists to restore those chunks to the review queue for editing
-- Full rebuild and re-embed actions are blocked while live repaired-chunk overrides still exist, because those overrides are part of the current ingest state
+- Full rebuild actions stay blocked while live repaired-chunk overrides still exist, because those overrides are part of the current ingest state
+
+## Extraction Payload Separation
+
+Graph extraction now separates chunk-body text from overlap context.
+
+Important behavior:
+
+- `[B#:C#]` provenance tags still exist for embeddings, chat context, and stored chunk provenance
+- Graph extraction and glean no longer see those tags as part of the extractable text
+- Overlap is passed separately as reference-only context so pronoun and alias resolution still works
+- Chunks are not re-split just for extraction, which keeps graph extraction aligned with embeddings and stored chunk provenance
 
 ## Chunk-Local Graph Binding
 

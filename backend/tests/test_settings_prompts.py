@@ -19,11 +19,13 @@ def test_load_settings_includes_entity_resolution_defaults(tmp_path, monkeypatch
     assert loaded["entity_resolution_chooser_prompt"] is None
     assert loaded["entity_resolution_combiner_prompt"] is None
     assert loaded["graph_architect_prompt"] is None
+    assert loaded["graph_architect_glean_prompt"] is None
 
 
 def test_prompt_keys_expose_graph_and_entity_resolution_prompts():
     expected = {
         "graph_architect_prompt",
+        "graph_architect_glean_prompt",
         "entity_resolution_chooser_prompt",
         "entity_resolution_combiner_prompt",
         "chat_system_prompt",
@@ -48,6 +50,7 @@ def test_load_prompt_prefers_custom_settings_and_falls_back_to_default(tmp_path,
         json.dumps(
             {
                 "graph_architect_prompt": "default graph prompt",
+                "graph_architect_glean_prompt": "default glean prompt",
                 "entity_resolution_chooser_prompt": "default chooser prompt",
                 "entity_resolution_combiner_prompt": "default combiner prompt",
             }
@@ -60,6 +63,7 @@ def test_load_prompt_prefers_custom_settings_and_falls_back_to_default(tmp_path,
 
     assert config.load_prompt("entity_resolution_chooser_prompt") == "custom chooser prompt"
     assert config.load_prompt("graph_architect_prompt") == "default graph prompt"
+    assert config.load_prompt("graph_architect_glean_prompt") == "default glean prompt"
     assert config.load_prompt("entity_resolution_combiner_prompt") == "default combiner prompt"
 
 

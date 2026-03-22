@@ -23,6 +23,8 @@ export type EntityResolutionRunMode = EntityResolutionMode | "ai_only";
 export interface EntityResolutionStartRequest {
     top_k: number;
     resolution_mode: EntityResolutionMode;
+    embedding_batch_size?: number;
+    embedding_cooldown_seconds?: number;
 }
 
 export interface EntityResolutionStatus {
@@ -36,6 +38,8 @@ export interface EntityResolutionStatus {
     unresolved_entities?: number;
     auto_resolved_pairs?: number;
     top_k?: number;
+    embedding_batch_size?: number;
+    embedding_cooldown_seconds?: number;
     resolution_mode?: EntityResolutionRunMode;
     include_normalized_exact_pass?: boolean;
     review_mode?: boolean;
@@ -181,7 +185,8 @@ export async function apiStreamPost(
     body: object,
     onEvent: (data: Record<string, unknown>) => void,
     onDone?: () => void,
-    onError?: (err: Error) => void
+    onError?: (err: Error) => void,
+    options: { signal?: AbortSignal } = {}
 ): Promise<void> {
     const url = `${API_BASE}${path}`;
     try {
@@ -189,6 +194,7 @@ export async function apiStreamPost(
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
+            signal: options.signal,
         });
 
         if (!res.ok) {
@@ -242,6 +248,9 @@ export async function apiStreamPost(
             throw new Error("Chat stream ended before the reply was fully saved.");
         }
     } catch (err) {
+        if ((err instanceof Error && err.name === "AbortError") || options.signal?.aborted) {
+            return;
+        }
         onError?.(normalizeFetchError(err));
     }
 }

@@ -70,6 +70,7 @@ async def update_settings(body: dict):
 
 PROMPT_KEYS = [
     "graph_architect_prompt",
+    "graph_architect_glean_prompt",
     "entity_resolution_chooser_prompt",
     "entity_resolution_combiner_prompt",
     "chat_system_prompt",

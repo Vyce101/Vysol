@@ -152,6 +152,7 @@ interface SafetyReviewItem {
     original_safety_reason: string;
     original_raw_text: string;
     original_prefixed_text: string;
+    overlap_raw_text?: string;
     draft_raw_text: string;
     last_test_outcome: "not_tested" | "still_safety_blocked" | "transient_failure" | "other_failure" | "passed";
     last_test_error_kind?: string | null;
@@ -1279,6 +1280,7 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
                 <CollapsibleSection title="Prompt Editor" open={showPrompts} onToggle={() => setShowPrompts(!showPrompts)}>
                     {[
                         "graph_architect_prompt",
+                        "graph_architect_glean_prompt",
                         "entity_resolution_chooser_prompt",
                         "entity_resolution_combiner_prompt",
                     ].map((key) => (
@@ -1820,9 +1822,30 @@ function SafetyReviewPanel({
                                             </div>
                                         </div>
 
+                                        {review.overlap_raw_text?.trim() && (
+                                            <div style={{ display: "grid", gap: 8 }}>
+                                                <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: 0.6 }}>
+                                                    Reference Overlap
+                                                </div>
+                                                <div style={{
+                                                    fontSize: 12,
+                                                    fontFamily: "monospace",
+                                                    padding: "9px 10px",
+                                                    borderRadius: 8,
+                                                    border: "1px solid var(--border)",
+                                                    background: "var(--background-secondary)",
+                                                    color: "var(--text-primary)",
+                                                    whiteSpace: "pre-wrap",
+                                                    lineHeight: 1.5,
+                                                }}>
+                                                    {review.overlap_raw_text}
+                                                </div>
+                                            </div>
+                                        )}
+
                                         <div style={{ display: "grid", gap: 8 }}>
                                             <div style={{ fontSize: 11, fontWeight: 700, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: 0.6 }}>
-                                                Raw Chunk
+                                                Editable Chunk Body
                                             </div>
                                             <textarea
                                                 id={`safety-review-textarea-${review.review_id}`}

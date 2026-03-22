@@ -30,6 +30,8 @@ class EntityResolutionStartRequest(BaseModel):
     review_mode: bool = False
     include_normalized_exact_pass: bool = True
     resolution_mode: Literal["exact_only", "exact_then_ai"] | None = None
+    embedding_batch_size: int | None = None
+    embedding_cooldown_seconds: float | None = None
 
 
 def _load_meta(world_id: str) -> dict:
@@ -46,6 +48,8 @@ def _run_entity_resolution_in_thread(
     review_mode: bool,
     include_normalized_exact_pass: bool,
     resolution_mode: str | None,
+    embedding_batch_size: int | None,
+    embedding_cooldown_seconds: float | None,
 ) -> None:
     asyncio.run(
         start_entity_resolution(
@@ -54,6 +58,8 @@ def _run_entity_resolution_in_thread(
             review_mode,
             include_normalized_exact_pass,
             resolve_entity_resolution_mode(resolution_mode, include_normalized_exact_pass),
+            embedding_batch_size,
+            embedding_cooldown_seconds,
         )
     )
 
@@ -77,6 +83,8 @@ async def entity_resolution_start(world_id: str, req: EntityResolutionStartReque
         req.review_mode,
         req.include_normalized_exact_pass,
         resolution_mode,
+        req.embedding_batch_size,
+        req.embedding_cooldown_seconds,
     )
     thread = threading.Thread(
         target=_run_entity_resolution_in_thread,
@@ -86,6 +94,8 @@ async def entity_resolution_start(world_id: str, req: EntityResolutionStartReque
             req.review_mode,
             req.include_normalized_exact_pass,
             resolution_mode,
+            req.embedding_batch_size,
+            req.embedding_cooldown_seconds,
         ),
         daemon=True,
         name=f"entity-resolution-{world_id}",

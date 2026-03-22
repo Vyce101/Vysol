@@ -43,8 +43,10 @@ def test_exact_only_mode_stops_after_normalized_match_pass(tmp_path, monkeypatch
 
     rebuild_calls: list[list[str]] = []
 
-    def _fake_rebuild_unique_node_index(_world_id, active_store):
+    async def _fake_rebuild_unique_node_index(_world_id, active_store, batch_size, cooldown_seconds, abort_event=None):
         rebuild_calls.append(sorted(active_store.graph.nodes()))
+        assert batch_size == 32
+        assert cooldown_seconds == 0.0
         return object()
 
     monkeypatch.setattr(engine, "_choose_matches", _fail_choose)
@@ -79,12 +81,24 @@ def test_exact_then_ai_mode_runs_chooser_and_combiner(tmp_path, monkeypatch):
     refreshed_merges: list[tuple[str, list[str]]] = []
     fake_unique_node_store = object()
 
-    def _fake_rebuild_unique_node_index(_world_id, active_store):
+    async def _fake_rebuild_unique_node_index(_world_id, active_store, batch_size, cooldown_seconds, abort_event=None):
         rebuild_calls.append(sorted(active_store.graph.nodes()))
+        assert batch_size == 32
+        assert cooldown_seconds == 0.0
         return fake_unique_node_store
 
-    def _fake_refresh_unique_node_index_after_merge(_vector_store, _active_store, winner_id, loser_ids):
+    async def _fake_refresh_unique_node_index_after_merge(
+        _vector_store,
+        _active_store,
+        winner_id,
+        loser_ids,
+        batch_size,
+        cooldown_seconds,
+        abort_event=None,
+    ):
         refreshed_merges.append((winner_id, list(loser_ids)))
+        assert batch_size == 32
+        assert cooldown_seconds == 0.0
 
     def _fake_query_candidates(active_store, unique_node_vector_store, anchor_id, remaining_ids, _top_k):
         assert active_store.world_id == world_id
@@ -140,8 +154,10 @@ def test_exact_then_ai_rebuilds_unique_index_after_exact_pass_before_candidate_s
     rebuild_calls: list[list[str]] = []
     fake_unique_node_store = object()
 
-    def _fake_rebuild_unique_node_index(_world_id, active_store):
+    async def _fake_rebuild_unique_node_index(_world_id, active_store, batch_size, cooldown_seconds, abort_event=None):
         rebuild_calls.append(sorted(active_store.graph.nodes()))
+        assert batch_size == 32
+        assert cooldown_seconds == 0.0
         return fake_unique_node_store
 
     def _fake_query_candidates(active_store, unique_node_vector_store, anchor_id, remaining_ids, _top_k):
@@ -189,3 +205,90 @@ def test_legacy_metadata_without_resolution_mode_maps_safely(tmp_path, monkeypat
 
     assert status["resolution_mode"] == "ai_only"
     assert status["include_normalized_exact_pass"] is False
+
+
+def test_entity_resolution_status_exposes_embedding_controls(tmp_path, monkeypatch):
+    world_id = "world-embed-controls-status"
+    meta_path, _ = _prepare_world(tmp_path, monkeypatch, world_id)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "entity_resolution_status": "idle",
+                "entity_resolution_phase": "waiting",
+                "entity_resolution_embedding_batch_size": 7,
+                "entity_resolution_embedding_cooldown_seconds": 1.5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = engine.get_resolution_status(world_id)
+
+    assert status["embedding_batch_size"] == 7
+    assert status["embedding_cooldown_seconds"] == 1.5
+
+
+def test_entity_resolution_start_uses_custom_embedding_controls(tmp_path, monkeypatch):
+    world_id = "world-custom-embed-controls"
+    _, store = _prepare_world(tmp_path, monkeypatch, world_id)
+    store.graph.add_node("node-a", display_name="Alice", description="Primary", claims=[], source_chunks=[])
+    store.graph.add_node("node-b", display_name="ALICE", description="Duplicate", claims=[], source_chunks=[])
+    store.save()
+
+    rebuild_calls: list[tuple[list[str], int, float]] = []
+
+    async def _fake_rebuild_unique_node_index(_world_id, active_store, batch_size, cooldown_seconds, abort_event=None):
+        rebuild_calls.append((sorted(active_store.graph.nodes()), batch_size, cooldown_seconds))
+        return object()
+
+    monkeypatch.setattr(engine, "_rebuild_unique_node_index", _fake_rebuild_unique_node_index)
+
+    asyncio.run(engine.start_entity_resolution(world_id, 50, False, True, "exact_only", 5, 1.25))
+
+    status = engine.get_resolution_status(world_id)
+
+    assert rebuild_calls == [(["node-a"], 5, 1.25)]
+    assert status["embedding_batch_size"] == 5
+    assert status["embedding_cooldown_seconds"] == 1.25
+
+
+def test_upsert_unique_node_snapshots_obeys_cooldown_and_abort(monkeypatch):
+    class _FakeVectorStore:
+        def __init__(self):
+            self.embed_calls: list[list[str]] = []
+            self.upsert_calls: list[list[str]] = []
+
+        def embed_texts(self, texts, api_key):
+            self.embed_calls.append(list(texts))
+            return [[0.1] for _ in texts]
+
+        def upsert_documents_embeddings(self, document_ids, texts, metadatas, embeddings):
+            self.upsert_calls.append(list(document_ids))
+
+    vector_store = _FakeVectorStore()
+    node_snapshots = [
+        {"node_id": "node-a", "display_name": "Alice", "description": "", "normalized_name": "alice"},
+        {"node_id": "node-b", "display_name": "Bob", "description": "", "normalized_name": "bob"},
+        {"node_id": "node-c", "display_name": "Cara", "description": "", "normalized_name": "cara"},
+    ]
+    abort_event = engine.threading.Event()
+    sleep_calls: list[float] = []
+
+    async def _fake_sleep_with_abort(expected_event, seconds):
+        sleep_calls.append(seconds)
+        expected_event.set()
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(engine, "_get_embedding_api_key", lambda: "test-key")
+    monkeypatch.setattr(engine, "_sleep_with_abort", _fake_sleep_with_abort)
+
+    try:
+        asyncio.run(engine._upsert_unique_node_snapshots(vector_store, node_snapshots, 2, 0.5, abort_event))
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("Expected the cooldown abort to cancel the batch loop.")
+
+    assert len(vector_store.embed_calls) == 1
+    assert len(vector_store.upsert_calls) == 1
+    assert sleep_calls == [0.5]

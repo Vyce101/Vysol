@@ -91,6 +91,7 @@ async def _call_agent(
     model_name: str,
     temperature: float,
     max_retries: int = 3,
+    extra_system_instruction: str | None = None,
 ) -> tuple[dict, dict]:
     """
     Call a Gemini agent with retry logic and key rotation.
@@ -112,6 +113,8 @@ async def _call_agent(
         ]
 
     system_prompt = load_prompt(prompt_key)
+    if extra_system_instruction:
+        system_prompt = f"{system_prompt.strip()}\n\n{extra_system_instruction.strip()}"
     backoff = [2, 4, 8]
     last_error = None
 
@@ -281,13 +284,13 @@ class RelationshipArchitectAgent:
 class GraphArchitectAgent:
     """Extracts both nodes and edges in a single pass."""
 
-    async def run(self, prefixed_chunk_text: str) -> tuple[GraphArchitectOutput, dict]:
+    async def run(self, extraction_chunk_text: str) -> tuple[GraphArchitectOutput, dict]:
         settings = load_settings()
         model = settings.get("default_model_flash", "gemini-flash-lite-latest")
 
         parsed, usage = await _call_agent(
             prompt_key="graph_architect_prompt",
-            user_content=prefixed_chunk_text,
+            user_content=extraction_chunk_text,
             model_name=model,
             temperature=0.1,
         )
@@ -305,27 +308,25 @@ class GraphArchitectAgent:
 
     async def run_glean(
         self,
-        prefixed_chunk_text: str,
+        extraction_chunk_text: str,
         previous_nodes: list[NodeOut],
         previous_edges: list[EdgeOut]
     ) -> tuple[GraphArchitectOutput, dict]:
         settings = load_settings()
         model = settings.get("default_model_flash", "gemini-flash-lite-latest")
 
-        # Append glean instructions to the user prompt
-        user_content = prefixed_chunk_text + "\n\n"
-        user_content += "MANY entities and relationships have been missed, continue with the extraction.\n"
-        user_content += "Here are the previously extracted entities:\n"
+        user_content = extraction_chunk_text + "\n\n"
+        user_content += "Here are the previously extracted entities for this same chunk:\n"
         user_content += json.dumps([n.model_dump() for n in previous_nodes], indent=2) + "\n"
-        user_content += "Here are the previously extracted relationships:\n"
+        user_content += "Here are the previously extracted relationships for this same chunk:\n"
         user_content += json.dumps([e.model_dump() for e in previous_edges], indent=2) + "\n"
-        user_content += "NEVER repeat the same entities and relationships from the previous answers.\n"
 
         parsed, usage = await _call_agent(
             prompt_key="graph_architect_prompt",
             user_content=user_content,
             model_name=model,
             temperature=0.1,
+            extra_system_instruction=load_prompt("graph_architect_glean_prompt"),
         )
 
         if not parsed:

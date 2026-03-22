@@ -44,6 +44,14 @@ interface ChatDetailResponse {
     version?: number;
 }
 
+interface ChatThreadState {
+    messages: Message[];
+    version: number | null;
+    streaming: boolean;
+    loadRequestId: number;
+    streamRequestId: number;
+}
+
 function getContextCopyText(payload: any): string {
     if (typeof payload === "string") return payload;
     if (payload === null || payload === undefined) return "";
@@ -216,19 +224,21 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     const { worldId } = use(params);
     const [threads, setThreads] = useState<ChatThread[]>([]);
     const [activeChatId, setActiveChatId] = useState<string | null>(null);
-    const [messages, setMessages] = useState<Message[]>([]);
-    const [chatVersion, setChatVersion] = useState<number | null>(null);
+    const [chatStates, setChatStates] = useState<Record<string, ChatThreadState>>({});
     const [input, setInput] = useState("");
-    const [streaming, setStreaming] = useState(false);
-    
+
     // UI Layout states
     const [threadsOpen, setThreadsOpen] = useState(true);
     const [sidebarOpen, setSidebarOpen] = useState(true);
     const [incomplete, setIncomplete] = useState(false);
-    
+
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const isAutoScrollEnabled = useRef(true);
+    const chatStatesRef = useRef<Record<string, ChatThreadState>>({});
+    const loadRequestCounterRef = useRef(0);
+    const streamRequestCounterRef = useRef(0);
+    const streamAbortControllersRef = useRef<Record<string, AbortController>>({});
 
     // Retrieval settings
     const [topK, setTopK] = useState(5);
@@ -253,6 +263,18 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const messageBubbleRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
+    const createEmptyThreadState = (): ChatThreadState => ({
+        messages: [],
+        version: null,
+        streaming: false,
+        loadRequestId: 0,
+        streamRequestId: 0,
+    });
+
+    const activeThreadState = activeChatId ? (chatStates[activeChatId] ?? createEmptyThreadState()) : createEmptyThreadState();
+    const messages = activeThreadState.messages;
+    const streaming = activeThreadState.streaming;
+
     const mapMessage = (m: any): Message => ({
         ...m,
         messageId: m.messageId || m.message_id,
@@ -261,6 +283,40 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
         contextPayload: m.contextPayload || m.context_payload,
         contextMeta: m.contextMeta || m.context_meta,
     });
+
+    const setThreadState = (chatId: string, updater: (current: ChatThreadState) => ChatThreadState) => {
+        setChatStates((prev) => {
+            const current = prev[chatId] ?? createEmptyThreadState();
+            const next = updater(current);
+            if (next === current) {
+                return prev;
+            }
+            return { ...prev, [chatId]: next };
+        });
+    };
+
+    const removeThreadState = (chatId: string) => {
+        setChatStates((prev) => {
+            if (!(chatId in prev)) {
+                return prev;
+            }
+            const next = { ...prev };
+            delete next[chatId];
+            return next;
+        });
+    };
+
+    const abortChatStream = (chatId: string) => {
+        const controller = streamAbortControllersRef.current[chatId];
+        if (controller) {
+            controller.abort();
+            delete streamAbortControllersRef.current[chatId];
+        }
+    };
+
+    const abortAllChatStreams = () => {
+        Object.keys(streamAbortControllersRef.current).forEach((chatId) => abortChatStream(chatId));
+    };
 
     async function loadRetrievalSettings() {
         try {
@@ -279,6 +335,10 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
             if (data.chat_history_messages !== undefined) setChatHistoryMsgs(data.chat_history_messages);
         } catch { /* ignore */ }
     };
+
+    useEffect(() => {
+        chatStatesRef.current = chatStates;
+    }, [chatStates]);
 
     useEffect(() => {
         if (isAutoScrollEnabled.current) {
@@ -328,58 +388,95 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                 deduped.push(thread);
             }
             setThreads(deduped);
-            if (deduped.length > 0 && !activeChatId) {
-                setActiveChatId(deduped[0].id);
-            }
+            setActiveChatId((prev) => {
+                if (prev && deduped.some((thread) => thread.id === prev)) {
+                    return prev;
+                }
+                return deduped[0]?.id ?? null;
+            });
         } catch { /* ignore */ }
     }
 
     async function loadChatDetails(chatId: string) {
+        const requestId = ++loadRequestCounterRef.current;
+        setThreadState(chatId, (current) => ({
+            ...current,
+            loadRequestId: requestId,
+        }));
         try {
             const data = await apiFetch<ChatDetailResponse>(`/worlds/${worldId}/chats/${chatId}`);
             const mapped = (data.messages || []).map(mapMessage);
-            setMessages(mapped);
-            setChatVersion(data.version ?? 0);
+            setThreadState(chatId, (current) => {
+                if (current.loadRequestId !== requestId || current.streaming) {
+                    return current;
+                }
+                return {
+                    ...current,
+                    messages: mapped,
+                    version: data.version ?? 0,
+                };
+            });
         } catch { /* ignore */ }
     }
 
+    // Cleanup should run when the world changes or the page unmounts, but does
+    // not need to retrigger for every render-time helper identity change.
     useEffect(() => {
+        return () => {
+            abortAllChatStreams();
+        };
+    }, [worldId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // These loaders are scoped to the current world id and intentionally rerun
+    // only when the world changes.
+    useEffect(() => {
+        setThreads([]);
+        setActiveChatId(null);
+        setChatStates({});
+        abortAllChatStreams();
         checkIngestionStatus();
         loadChatPrompt();
         loadThreads();
         loadRetrievalSettings();
-    }, [worldId]);
+    }, [worldId]); // eslint-disable-line react-hooks/exhaustive-deps
 
+    // Thread details should refresh when the active chat changes, while the
+    // per-thread cache preserves the currently rendered history immediately.
     useEffect(() => {
         if (activeChatId) {
-            loadChatDetails(activeChatId);
-        } else {
-            setMessages([]);
-            setChatVersion(null);
+            void loadChatDetails(activeChatId);
         }
-    }, [activeChatId, worldId]);
+    }, [activeChatId, worldId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    const createNewChat = async () => {
+    const createNewChat = async (title = "New Chat"): Promise<string | null> => {
         try {
             const data = await apiFetch<{ id: string; version?: number }>(`/worlds/${worldId}/chats`, {
                 method: "POST", 
-                body: JSON.stringify({ title: "New Chat" }) 
+                body: JSON.stringify({ title })
             });
+            setThreadState(data.id, (current) => ({
+                ...current,
+                messages: [],
+                version: data.version ?? null,
+                streaming: false,
+            }));
             setActiveChatId(data.id);
-            setMessages([]);
-            setChatVersion(data.version ?? null);
-            loadThreads();
+            void loadThreads();
+            return data.id;
         } catch { /* ignore */ }
-    }
+        return null;
+    };
 
     const deleteChat = async (chatId: string) => {
         if (!confirm("Delete this chat?")) return;
         try {
+            abortChatStream(chatId);
             await apiFetch(`/worlds/${worldId}/chats/${chatId}`, { method: "DELETE" });
+            removeThreadState(chatId);
             if (activeChatId === chatId) {
                 setActiveChatId(null);
             }
-            loadThreads();
+            void loadThreads();
         } catch { /* ignore */ }
     };
 
@@ -391,6 +488,7 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     };
 
     const saveChatHistory = async (chatId: string, newMessages: Message[]) => {
+        const baseVersion = chatStatesRef.current[chatId]?.version ?? 0;
         try {
             const data = await apiFetch<{ version?: number; messages?: any[] }>(`/worlds/${worldId}/chats/${chatId}/history`, {
                 method: "PUT",
@@ -404,13 +502,15 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                         context_payload: message.contextPayload,
                         context_meta: message.contextMeta,
                     })),
-                    base_version: chatVersion ?? 0,
+                    base_version: baseVersion,
                 })
             });
-            setChatVersion(data.version ?? chatVersion);
-            if (data.messages) {
-                setMessages(data.messages.map(mapMessage));
-            }
+            setThreadState(chatId, (current) => ({
+                ...current,
+                version: data.version ?? current.version,
+                messages: data.messages ? data.messages.map(mapMessage) : newMessages,
+                streaming: false,
+            }));
             return true;
         } catch (err) {
             if (err instanceof ApiError && err.status === 409) {
@@ -425,35 +525,35 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
 
     const handleSend = async (customInput?: string, customHistory?: Message[]) => {
         const textToSend = customInput ?? input;
-        if (!textToSend.trim() || streaming) return;
+        if (!textToSend.trim()) return;
 
         let currentChatId = activeChatId;
 
         if (!currentChatId) {
-            try {
-                const title = textToSend.slice(0, 30) + (textToSend.length > 30 ? "..." : "");
-                const data = await apiFetch<{ id: string; version?: number }>(`/worlds/${worldId}/chats`, {
-                    method: "POST", 
-                    body: JSON.stringify({ title }) 
-                });
-                currentChatId = data.id;
-                setActiveChatId(currentChatId);
-                setChatVersion(data.version ?? null);
-                await loadThreads();
-            } catch {
+            const title = textToSend.slice(0, 30) + (textToSend.length > 30 ? "..." : "");
+            currentChatId = await createNewChat(title);
+            if (!currentChatId) {
                 alert("Failed to create chat");
                 return;
             }
         }
 
+        const currentState = chatStatesRef.current[currentChatId] ?? createEmptyThreadState();
+        if (currentState.streaming) return;
+
         const userMsg: Message = { role: "user", content: textToSend, status: "complete" };
-        const historyToUse = customHistory || messages;
+        const historyToUse = customHistory ?? currentState.messages;
         const newHistory = [...historyToUse, userMsg];
         const optimisticReply: Message = { role: "model", content: "", status: "streaming" };
-        
-        setMessages([...newHistory, optimisticReply]);
+        const streamRequestId = ++streamRequestCounterRef.current;
+
+        setThreadState(currentChatId, (current) => ({
+            ...current,
+            messages: [...newHistory, optimisticReply],
+            streaming: true,
+            streamRequestId,
+        }));
         if (customInput === undefined) setInput("");
-        setStreaming(true);
 
         let accum = "";
         let nodesUsed: Message["nodesUsed"] = [];
@@ -461,6 +561,10 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
         let contextMeta: any = null;
         let persistedMessageId: string | undefined;
         let persistedVersion: number | null = null;
+        const controller = new AbortController();
+
+        abortChatStream(currentChatId);
+        streamAbortControllersRef.current[currentChatId] = controller;
 
         await apiStreamPost(
             `/worlds/${worldId}/chats/${currentChatId}/message`,
@@ -478,15 +582,21 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
             (data) => {
                 if (data.token) {
                     accum += data.token as string;
-                    setMessages((prev) => {
-                        const updated = [...prev];
+                    setThreadState(currentChatId, (current) => {
+                        if (current.streamRequestId !== streamRequestId || current.messages.length === 0) {
+                            return current;
+                        }
+                        const updated = [...current.messages];
                         updated[updated.length - 1] = {
                             ...updated[updated.length - 1],
                             role: "model",
                             content: accum,
                             status: "streaming",
                         };
-                        return updated;
+                        return {
+                            ...current,
+                            messages: updated,
+                        };
                     });
                 }
                 if (data.event === "done") {
@@ -496,53 +606,70 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                     if (data.context_payload) contextPayload = data.context_payload;
                     if (data.context_meta) contextMeta = data.context_meta;
                     if (typeof data.chat_version === "number") {
-                        setChatVersion(data.chat_version);
+                        setThreadState(currentChatId, (current) => (
+                            current.streamRequestId !== streamRequestId
+                                ? current
+                                : { ...current, version: data.chat_version as number }
+                        ));
                     }
                 }
             },
             () => {
-                setMessages((prev) => {
-                    const updated = [...prev];
-                    updated[updated.length - 1] = {
-                        ...updated[updated.length - 1],
-                        role: "model",
-                        content: accum,
-                        messageId: persistedMessageId,
-                        status: "complete",
-                        nodesUsed,
-                        contextPayload,
-                        contextMeta,
+                delete streamAbortControllersRef.current[currentChatId];
+                setThreadState(currentChatId, (current) => {
+                    if (current.streamRequestId !== streamRequestId) {
+                        return current;
+                    }
+                    const updated = [...current.messages];
+                    if (updated.length > 0) {
+                        updated[updated.length - 1] = {
+                            ...updated[updated.length - 1],
+                            role: "model",
+                            content: accum,
+                            messageId: persistedMessageId,
+                            status: "complete",
+                            nodesUsed,
+                            contextPayload,
+                            contextMeta,
+                        };
+                    }
+                    return {
+                        ...current,
+                        messages: updated,
+                        version: persistedVersion ?? current.version,
+                        streaming: false,
                     };
-                    return updated;
                 });
-                if (persistedVersion !== null) {
-                    setChatVersion(persistedVersion);
-                }
-                setStreaming(false);
-                loadThreads(); // Refresh thread list to update timestamp/names
+                void loadThreads();
             },
             (err) => {
-                setStreaming(false);
+                delete streamAbortControllersRef.current[currentChatId];
+                setThreadState(currentChatId, (current) => (
+                    current.streamRequestId !== streamRequestId
+                        ? current
+                        : { ...current, streaming: false }
+                ));
                 void loadThreads();
-                if (currentChatId) {
-                    void loadChatDetails(currentChatId);
-                }
+                void loadChatDetails(currentChatId);
                 alert(err.message.includes("fully saved")
                     ? "The reply was interrupted before it finished saving. The partial reply was preserved as incomplete."
                     : err.message);
-            }
+            },
+            { signal: controller.signal }
         );
-    }
+    };
 
     const deleteMessage = async (index: number) => {
         if (!confirm("Are you sure you want to delete this message?")) return;
+        if (!activeChatId) return;
         const newMessages = [...messages];
         newMessages.splice(index, 1);
-        setMessages(newMessages);
+        setThreadState(activeChatId, (current) => ({
+            ...current,
+            messages: newMessages,
+        }));
         setMenuOpenIndex(null);
-        if (activeChatId) {
-            await saveChatHistory(activeChatId, newMessages);
-        }
+        await saveChatHistory(activeChatId, newMessages);
     };
 
     const startEditing = (index: number) => {
@@ -555,13 +682,15 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
     };
 
     const saveEdit = async (index: number) => {
+        if (!activeChatId) return;
         const newMessages = [...messages];
         newMessages[index].content = editContent;
-        setMessages(newMessages);
+        setThreadState(activeChatId, (current) => ({
+            ...current,
+            messages: newMessages,
+        }));
         setEditingIndex(null);
-        if (activeChatId) {
-            await saveChatHistory(activeChatId, newMessages);
-        }
+        await saveChatHistory(activeChatId, newMessages);
     };
 
     const regenerateMessage = async (index: number) => {
@@ -582,7 +711,12 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
             promptToResend = msg.content;
         }
         
-        setMessages(newMessages);
+        if (activeChatId) {
+            setThreadState(activeChatId, (current) => ({
+                ...current,
+                messages: newMessages,
+            }));
+        }
         setMenuOpenIndex(null);
         if (activeChatId) {
             const saved = await saveChatHistory(activeChatId, newMessages);
@@ -590,7 +724,7 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
                 return;
             }
         }
-        handleSend(promptToResend, newMessages);
+        await handleSend(promptToResend, newMessages);
     };
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -629,7 +763,7 @@ export default function ChatPage({ params }: { params: Promise<{ worldId: string
             {threadsOpen && (
                 <div style={{ width: 280, borderRight: "1px solid var(--border)", background: "var(--background)", display: "flex", flexDirection: "column", flexShrink: 0 }}>
                     <div style={{ padding: "16px", borderBottom: "1px solid var(--border)" }}>
-                        <button onClick={createNewChat} style={{ 
+                        <button onClick={() => { void createNewChat(); }} style={{
                             width: "100%", padding: "8px 16px", background: "var(--primary)", 
                             color: "var(--primary-contrast)", borderRadius: "var(--radius)", border: "none", 
                             cursor: "pointer", fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "center", gap: 6

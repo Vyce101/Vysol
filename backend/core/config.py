@@ -38,6 +38,7 @@ _DEFAULT_SETTINGS = {
     "glean_amount": 1,
     "extract_entity_types": True,
     "graph_architect_prompt": None,
+    "graph_architect_glean_prompt": None,
     "entity_resolution_chooser_prompt": None,
     "entity_resolution_combiner_prompt": None,
     "chat_system_prompt": None,

@@ -11,9 +11,9 @@
 
 VySol is an accessible local-first graph RAG app built to make ingestion, graph extraction, entity resolution, embeddings, and chat easy to set up and use in one place.
 
-You can ingest plain-text source material, control how the graph is built, resolve duplicate entities after ingestion, and chat with both chunk retrieval and graph context without leaving the app.
+You can ingest plain-text source material, control how the graph is built, resolve duplicate entities after ingestion, review and repair extraction safety blocks in-app, and chat with both chunk retrieval and graph context without leaving the app.
 
-Entity resolution supports a fast `Exact only` cleanup pass or a fuller `Exact + chooser/combiner` workflow after ingestion.
+Entity resolution supports a fast `Exact only` cleanup pass or a fuller `Exact + chooser/combiner` workflow after ingestion, plus per-run unique-node embedding batch and delay controls.
 
 This project is licensed under the GNU AGPLv3. Companies requiring a commercial license should see [COMMERCIAL.md](COMMERCIAL.md).
 
@@ -32,6 +32,7 @@ It gives you one place to:
 - Extract entities and relationships into a graph
 - Rebuild vectors or fully rebuild ingests when needed
 - Resolve duplicate entities after ingestion
+- Repair blocked chunks with the Safety Review Queue and reusable chunk-body overrides
 - Chat against chunk retrieval and graph context together
 - Trace every graph edge back to its source document and chunk, useful for chronological documents
 - Inspect exactly what context was sent for every chat message with Context X-Ray

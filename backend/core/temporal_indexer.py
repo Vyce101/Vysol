@@ -9,6 +9,8 @@ class TemporalChunk(BaseModel):
     """A chunk with its [B:C] prefix and metadata."""
     prefixed_text: str
     raw_text: str
+    primary_text: str
+    overlap_text: str
     book_number: int
     chunk_index: int
     source_id: str
@@ -29,9 +31,14 @@ def stamp_chunks(
     for chunk in chunks:
         idx = chunk["index"]
         prefix = f"[B{book_number}:C{idx}] "
+        raw_text = str(chunk.get("text") or "")
+        primary_text = str(chunk.get("primary_text") or raw_text)
+        overlap_text = str(chunk.get("overlap_text") or "")
         result.append(TemporalChunk(
-            prefixed_text=prefix + chunk["text"],
-            raw_text=chunk["text"],
+            prefixed_text=prefix + raw_text,
+            raw_text=raw_text,
+            primary_text=primary_text,
+            overlap_text=overlap_text,
             book_number=book_number,
             chunk_index=idx,
             source_id=source_id,

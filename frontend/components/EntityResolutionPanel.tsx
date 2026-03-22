@@ -124,6 +124,8 @@ export default function EntityResolutionPanel({
 }: EntityResolutionPanelProps) {
     const [open, setOpen] = useState(false);
     const [topK, setTopK] = useState(50);
+    const [embeddingBatchSize, setEmbeddingBatchSize] = useState(32);
+    const [embeddingCooldownSeconds, setEmbeddingCooldownSeconds] = useState(0);
     const [resolutionMode, setResolutionMode] = useState<EntityResolutionMode>("exact_then_ai");
     const [status, setStatus] = useState<EntityResolutionStatus | null>(null);
     const [logs, setLogs] = useState<ResolutionLogRow[]>([]);
@@ -148,6 +150,12 @@ export default function EntityResolutionPanel({
         setError(null);
         if (typeof next.top_k === "number") {
             setTopK(next.top_k);
+        }
+        if (typeof next.embedding_batch_size === "number") {
+            setEmbeddingBatchSize(Math.max(1, Math.trunc(next.embedding_batch_size)));
+        }
+        if (typeof next.embedding_cooldown_seconds === "number") {
+            setEmbeddingCooldownSeconds(Math.max(0, next.embedding_cooldown_seconds));
         }
         if (isRequestResolutionMode(next.resolution_mode)) {
             setResolutionMode(next.resolution_mode);
@@ -237,6 +245,12 @@ export default function EntityResolutionPanel({
     const triggerDisabled = !running && !canResolve;
     const badge = statusBadge(status?.status || (running ? "running" : "idle"));
     const displayedTopK = typeof status?.top_k === "number" ? status.top_k : topK;
+    const displayedEmbeddingBatchSize = typeof status?.embedding_batch_size === "number"
+        ? Math.max(1, Math.trunc(status.embedding_batch_size))
+        : embeddingBatchSize;
+    const displayedEmbeddingCooldownSeconds = typeof status?.embedding_cooldown_seconds === "number"
+        ? Math.max(0, status.embedding_cooldown_seconds)
+        : embeddingCooldownSeconds;
     const activeResolutionMode: EntityResolutionRunMode = (status?.resolution_mode as EntityResolutionRunMode | undefined) || resolutionMode;
     const topKInUse = usesAiResolution(activeResolutionMode);
     const eventRows = [...logs].reverse();
@@ -248,6 +262,8 @@ export default function EntityResolutionPanel({
             await startEntityResolution(worldId, {
                 top_k: topK,
                 resolution_mode: resolutionMode,
+                embedding_batch_size: embeddingBatchSize,
+                embedding_cooldown_seconds: embeddingCooldownSeconds,
             });
             setOpen(true);
             await loadSnapshot(true);
@@ -408,6 +424,14 @@ export default function EntityResolutionPanel({
                                     <div style={summaryLabelStyle}>Top K</div>
                                     <div style={summaryValueStyle}>{topKInUse ? formatCount(displayedTopK) : "Not Used"}</div>
                                 </div>
+                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
+                                    <div style={summaryLabelStyle}>Embed Batch</div>
+                                    <div style={summaryValueStyle}>{formatCount(displayedEmbeddingBatchSize)}</div>
+                                </div>
+                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
+                                    <div style={summaryLabelStyle}>Embed Delay</div>
+                                    <div style={summaryValueStyle}>{displayedEmbeddingCooldownSeconds.toFixed(2)}s</div>
+                                </div>
                             </div>
 
                             {status?.current_anchor && (
@@ -498,6 +522,39 @@ export default function EntityResolutionPanel({
                                                 : "Used for candidate search before chooser/combiner review."}
                                         </span>
                                     </label>
+                                    <label style={controlLabelStyle}>
+                                        <span style={controlTextStyle}>Embedding batch size</span>
+                                        <input
+                                            type="number"
+                                            min={1}
+                                            max={1000}
+                                            value={embeddingBatchSize}
+                                            onChange={(e) => setEmbeddingBatchSize(Math.max(1, Number(e.target.value) || 1))}
+                                            disabled={busy || running}
+                                            style={controlInputStyle}
+                                        />
+                                        <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4 }}>
+                                            Applies to unique-node re-embedding during entity resolution, including exact-only runs.
+                                        </span>
+                                    </label>
+                                    <label style={controlLabelStyle}>
+                                        <span style={controlTextStyle}>Embedding delay (seconds)</span>
+                                        <input
+                                            type="number"
+                                            min={0}
+                                            step={0.1}
+                                            value={embeddingCooldownSeconds}
+                                            onChange={(e) => setEmbeddingCooldownSeconds(Math.max(0, Number(e.target.value) || 0))}
+                                            disabled={busy || running}
+                                            style={controlInputStyle}
+                                        />
+                                        <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4 }}>
+                                            Wait time between unique-node embedding batches. This does not affect chooser or combiner model calls.
+                                        </span>
+                                    </label>
+                                </div>
+                                <div style={{ marginTop: 12, fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                                    Entity resolution uses its own per-run embedding batch and delay controls here. These settings do not change ingest or Re-embed All behavior.
                                 </div>
 
                                 <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 class ChunkMeta:
     """Metadata for a single chunk."""
     text: str
+    primary_text: str
+    overlap_text: str
     char_start: int
     char_end: int
     index: int
@@ -44,6 +46,8 @@ class RecursiveChunker:
 
             results.append(ChunkMeta(
                 text=chunk_text.strip(),
+                primary_text=chunk_text.strip(),
+                overlap_text="",
                 char_start=start,
                 char_end=end,
                 index=i,
@@ -59,9 +63,11 @@ class RecursiveChunker:
                 space_idx = overlap_text.find(" ")
                 if space_idx > 0:
                     overlap_text = overlap_text[space_idx + 1:]
-                new_text = overlap_text + " " + results[i].text
+                new_text = overlap_text + " " + results[i].primary_text
                 overlapped.append(ChunkMeta(
                     text=new_text.strip(),
+                    primary_text=results[i].primary_text,
+                    overlap_text=overlap_text.strip(),
                     char_start=results[i].char_start - len(overlap_text),
                     char_end=results[i].char_end,
                     index=i,

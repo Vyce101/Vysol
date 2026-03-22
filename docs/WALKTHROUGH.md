@@ -142,6 +142,12 @@ The prompt editor lets you override the shipped defaults, but the defaults are e
 Graph Architect Prompt:
 
 - Controls how the extraction model turns text into entities and relationships
+- Receives the chunk body plus any overlap as separate inputs, so overlap is reference-only context instead of part of the extractable body
+
+Graph Architect Glean Prompt:
+
+- Controls how later extraction passes continue after the first graph pass
+- Lets you tune how the glean step uses previously extracted entities and relationships to find missed graph details
 
 Entity Resolution Chooser Prompt:
 
@@ -176,8 +182,8 @@ If extraction hits a safety block:
 
 - The ingest log warns you as soon as the block is detected
 - A `Safety Review Queue` appears for blocked chunks
-- Each review item keeps a read-only `[B#:C#]` prefix plus one editable `Raw Chunk` field
-- `Test` retries that exact chunk with your edited raw text while keeping the original source chunk untouched
+- Each review item keeps a read-only `[B#:C#]` prefix, a separate read-only overlap box when overlap exists, and one editable `Chunk Body` field
+- `Test` retries that exact chunk with your edited chunk body while keeping the original source chunk untouched
 - `Reset` always restores the true original source chunk, even after multiple edits or a prior successful repair
 - `Discard` removes that repair item and its override state
 
@@ -185,6 +191,9 @@ Entity-resolution controls:
 
 - `Resolution mode` chooses whether the run stops after exact normalized matching or continues into chooser/combiner review
 - `Top K candidates` is used only for `Exact + chooser/combiner`
+- `Embedding batch size` controls unique-node embedding rebuild batch size for that entity-resolution run
+- `Embedding delay (seconds)` adds a per-batch cooldown to that same unique-node embedding rebuild step
+- The embedding controls apply to entity resolution only; they do not change ingest or `Re-embed All`
 
 ## Rebuild And Retry Actions
 
@@ -195,7 +204,8 @@ Use the rebuild and retry actions based on what went wrong:
 - Clears and rebuilds chunk vectors from the previously fully ingested source set and unique-node vectors from the current saved graph state
 - Ignores brand-new pending sources you added after the last clean ingest
 - Is blocked if an older ingested source is missing, changed, partial, failed, or comes from an older world that never recorded source snapshots
-- Is also blocked while this world still has unresolved safety-review work or active repaired-chunk overrides, because a rebuild would otherwise lose or desynchronize repaired chunk text
+- Uses active repaired chunk bodies when the locked source snapshot and chunk map still match
+- Is blocked while this world still has unresolved safety-review work, because the rebuild would otherwise operate on incomplete repair state
 - Use this when you change only the world embedding model or need to rebuild vectors without re-extracting the graph
 
 `Re-ingest With Previous Settings`
@@ -226,6 +236,7 @@ Important behavior:
 
 - `Resume` is the normal path when you simply add another new source after a previous ingest
 - `Re-embed All` is intentionally narrower than a full rebuild and will now explain when it is unsafe
+- `Re-embed All` can reuse active repaired chunk bodies, but full rebuild paths still require those overrides to be discarded first
 - `Retry` actions only repair failures inside the currently locked ingest; they do not apply new chunk settings
 - The one-shot collapsed-chunk recovery action is only for the current world and current failed chunks; it does not teach future ingests to always treat those chunks as safety-blocked
 
@@ -242,7 +253,7 @@ Chat settings:
 `Entry Nodes`
 
 - How many graph entry nodes are selected before graph expansion begins
-- If number of entry nodes matches or exceedes the total amount of nodes, all edges will be placed into context for future queries until brought below the amount of nodes inside the ingested world
+- Entry-node retrieval now ranks against one persistent vector per current graph node, not repeated chunk-local node occurrences
 
 `Graph Hops`
 
@@ -251,6 +262,7 @@ Chat settings:
 `Max Graph Nodes`
 
 - A hard cap on how many graph nodes can be included
+- Actual returned graph size can still be lower if the selected entry nodes simply do not reach that many unique nodes
 
 `Vector Query (Msgs)`
 
