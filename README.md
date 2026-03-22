@@ -20,7 +20,7 @@ This project is licensed under the GNU AGPLv3. Companies requiring a commercial 
 ## Supported OS
 
 - Windows: Supported (`VySol.bat` launcher)
-- macOS/Linux: Manual setup only (no supported launcher path yet)
+- macOS/Linux: Manual setup only for now (coming soon)
 
 ## What This Project Is
 
