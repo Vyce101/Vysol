@@ -130,6 +130,52 @@ def test_vector_store_embed_texts_batches_multiple_contents(monkeypatch):
     assert captured["contents"] == ["first", "second"]
 
 
+def test_vector_store_embed_texts_retries_timeout_on_next_key(monkeypatch):
+    collection = DummyCollection()
+    calls: list[str] = []
+
+    class DummyKM:
+        api_keys = ["k1", "k2"]
+        key_count = 2
+
+        def __init__(self):
+            self.reported: list[tuple[int, str]] = []
+
+        def wait_for_available_key(self, *, jitter_seconds: float = 0.25):
+            return ("k2", 1)
+
+        def report_error(self, key_index: int, error_type: str) -> None:
+            self.reported.append((key_index, error_type))
+
+    class DummyModels:
+        def __init__(self, api_key: str):
+            self.api_key = api_key
+
+        def embed_content(self, *, model: str, contents):
+            calls.append(self.api_key)
+            if self.api_key == "k1":
+                raise RuntimeError("request timed out")
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.7, 0.8, 0.9])])
+
+    class DummyGenAIClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels(api_key)
+
+    dummy_km = DummyKM()
+
+    _patch_vector_dependencies(monkeypatch, collection=collection, embedding_model="gemini-embedding-001")
+    monkeypatch.setattr(vector_store.genai, "Client", DummyGenAIClient)
+    monkeypatch.setattr(vector_store, "get_key_manager", lambda: dummy_km)
+    monkeypatch.setattr(vector_store.time, "sleep", lambda seconds: None)
+
+    store = vector_store.VectorStore("world-123")
+    embedding = store.embed_text("hello world", api_key="k1")
+
+    assert embedding == [0.7, 0.8, 0.9]
+    assert calls == ["k1", "k2"]
+    assert dummy_km.reported == [(0, "timeout")]
+
+
 def test_vector_store_query_blocks_when_manifest_model_is_stale(monkeypatch):
     collection = DummyCollection()
     manifest = {"collections": {}}

@@ -88,7 +88,7 @@ def _patch_retrieval_dependencies(
             return len(chunk_results or [])
 
     class DummyKeyManager:
-        def get_active_key(self):
+        def wait_for_available_key(self, *, jitter_seconds: float = 0.25):
             return "test-key", 0
 
     monkeypatch.setattr(retrieval_engine, "GraphStore", DummyGraphStore)

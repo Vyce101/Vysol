@@ -1,54 +1,101 @@
 import json
+from pathlib import Path
+
+import pytest
 
 from core import config, key_manager
 
 
-def test_key_manager_uses_only_enabled_saved_keys(tmp_path, monkeypatch):
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(
-        json.dumps(
-            {
-                "api_keys": [
-                    {"value": "k1", "enabled": True},
-                    {"value": "k2", "enabled": False},
-                    {"value": "k3", "enabled": True},
-                ],
-                "key_rotation_mode": "ROUND_ROBIN",
-            }
-        ),
-        encoding="utf-8",
-    )
+def _temp_settings_path(name: str) -> Path:
+    root = Path(__file__).resolve().parents[2]
+    temp_dir = root / ".codex-test-key-manager"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir / name
 
-    monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
-    monkeypatch.setattr(key_manager, "_key_manager", None)
 
-    manager = key_manager.get_key_manager(force_reload=True)
+def test_key_manager_uses_only_enabled_saved_keys(monkeypatch):
+    settings_path = _temp_settings_path("settings-enabled.json")
+    try:
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "api_keys": [
+                        {"value": "k1", "enabled": True},
+                        {"value": "k2", "enabled": False},
+                        {"value": "k3", "enabled": True},
+                    ],
+                    "key_rotation_mode": "ROUND_ROBIN",
+                }
+            ),
+            encoding="utf-8",
+        )
 
-    assert manager.api_keys == ["k1", "k3"]
+        monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
+        monkeypatch.setattr(key_manager, "_key_manager", None)
+
+        manager = key_manager.get_key_manager(force_reload=True)
+
+        assert manager.api_keys == ["k1", "k3"]
+        assert manager.get_active_key() == ("k1", 0)
+        assert manager.get_active_key() == ("k3", 1)
+    finally:
+        if settings_path.exists():
+            settings_path.unlink()
+        if settings_path.parent.exists() and not any(settings_path.parent.iterdir()):
+            settings_path.parent.rmdir()
+
+
+def test_key_manager_falls_back_to_env_when_all_saved_keys_are_disabled(monkeypatch):
+    settings_path = _temp_settings_path("settings-disabled.json")
+    try:
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "api_keys": [
+                        {"value": "k1", "enabled": False},
+                        {"value": "k2", "enabled": False},
+                    ],
+                    "key_rotation_mode": "FAIL_OVER",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
+        monkeypatch.setattr(key_manager, "_key_manager", None)
+        monkeypatch.setenv("GEMINI_API_KEY", "env-key")
+
+        manager = key_manager.get_key_manager(force_reload=True)
+
+        assert manager.api_keys == ["env-key"]
+        assert manager.get_active_key() == ("env-key", 0)
+    finally:
+        if settings_path.exists():
+            settings_path.unlink()
+        if settings_path.parent.exists() and not any(settings_path.parent.iterdir()):
+            settings_path.parent.rmdir()
+
+
+def test_key_manager_raises_structured_cooldown_error(monkeypatch):
+    manager = key_manager.KeyManager(api_keys=["k1", "k2"], mode="ROUND_ROBIN")
+    now = 100.0
+
+    monkeypatch.setattr(key_manager.time, "time", lambda: now)
+
+    manager.report_error(0, "429")
+    manager.report_error(1, "429")
+
+    with pytest.raises(key_manager.AllKeysInCooldownError) as exc:
+        manager.get_active_key()
+
+    assert exc.value.retry_after_seconds == 65.0
+    assert "Retry in 65 seconds" in str(exc.value)
+
+
+def test_round_robin_does_not_skip_next_key_after_transient_cooldown():
+    manager = key_manager.KeyManager(api_keys=["k1", "k2", "k3"], mode="ROUND_ROBIN")
+
     assert manager.get_active_key() == ("k1", 0)
-    assert manager.get_active_key() == ("k3", 1)
+    manager.report_error(0, "timeout")
 
-
-def test_key_manager_falls_back_to_env_when_all_saved_keys_are_disabled(tmp_path, monkeypatch):
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(
-        json.dumps(
-            {
-                "api_keys": [
-                    {"value": "k1", "enabled": False},
-                    {"value": "k2", "enabled": False},
-                ],
-                "key_rotation_mode": "FAIL_OVER",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(config, "SETTINGS_FILE", settings_path)
-    monkeypatch.setattr(key_manager, "_key_manager", None)
-    monkeypatch.setenv("GEMINI_API_KEY", "env-key")
-
-    manager = key_manager.get_key_manager(force_reload=True)
-
-    assert manager.api_keys == ["env-key"]
-    assert manager.get_active_key() == ("env-key", 0)
+    assert manager.get_active_key() == ("k2", 1)

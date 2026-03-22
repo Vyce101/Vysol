@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 import chromadb
@@ -15,7 +16,7 @@ from .config import (
     set_world_embedding_model,
     world_chroma_dir,
 )
-from .key_manager import get_key_manager
+from .key_manager import classify_transient_provider_error, get_key_manager, jittered_delay
 
 logger = logging.getLogger(__name__)
 
@@ -161,11 +162,13 @@ class VectorStore:
 
         candidates = self._candidate_embedding_models()
         last_error: Exception | None = None
+        key_manager = get_key_manager()
         current_api_key = api_key
+        current_key_index = self._lookup_key_index(current_api_key, set())
         used_key_indices: set[int] = set()
-        max_key_attempts = max(1, get_key_manager().key_count)
+        max_key_attempts = max(3, key_manager.key_count * 2)
 
-        for _ in range(max_key_attempts):
+        for attempt in range(max_key_attempts):
             client = self._get_embed_client(current_api_key)
             rotate_key = False
 
@@ -183,43 +186,23 @@ class VectorStore:
                 except Exception as e:
                     last_error = e
                     message = str(e).lower()
-                    key_index = self._lookup_key_index(current_api_key, used_key_indices)
+                    transient_kind = classify_transient_provider_error(e)
 
-                    if "429" in message or "resource_exhausted" in message:
-                        if key_index is not None:
-                            used_key_indices.add(key_index)
-                            key_manager = get_key_manager()
-                            key_manager.report_error(key_index, "429")
-                            key_manager.advance_index()
-                            try:
-                                current_api_key, _ = key_manager.get_active_key()
-                            except RuntimeError:
-                                rotate_key = False
-                                break
-                            rotate_key = True
-                            break
+                    if transient_kind and current_key_index is not None:
+                        used_key_indices.add(current_key_index)
+                        key_manager.report_error(current_key_index, transient_kind)
+                        current_api_key, current_key_index = key_manager.wait_for_available_key()
+                        rotate_key = True
+                        break
 
-                    if "500" in message or "internal" in message:
-                        if key_index is not None:
-                            used_key_indices.add(key_index)
-                            key_manager = get_key_manager()
-                            key_manager.report_error(key_index, "500")
-                            key_manager.advance_index()
-                            try:
-                                current_api_key, _ = key_manager.get_active_key()
-                            except RuntimeError:
-                                rotate_key = False
-                                break
-                            rotate_key = True
-                            break
-
-                    # Retry only when model ID is unsupported/not found.
                     if ("not found" in message or "not supported" in message) and model_name != candidates[-1]:
                         continue
                     rotate_key = False
                     break
 
             if rotate_key:
+                if attempt < max_key_attempts - 1:
+                    time.sleep(jittered_delay(0.5))
                 continue
             break
 

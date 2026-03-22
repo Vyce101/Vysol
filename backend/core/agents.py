@@ -12,7 +12,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from .config import load_prompt, load_settings
-from .key_manager import get_key_manager
+from .key_manager import classify_transient_provider_error, get_key_manager, jittered_delay
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,6 @@ class AgentCallError(RuntimeError):
         self.blocked_prefixed_text = blocked_prefixed_text
         self.blocked_raw_text = blocked_raw_text
 
-
-# ── Output models ──────────────────────────────────────────────────────
 
 class NodeOut(BaseModel):
     node_id: str
@@ -83,8 +81,6 @@ class ScribeOutput(BaseModel):
     merged_claims: list[ClaimOut] = []
 
 
-# ── Agent call helper ──────────────────────────────────────────────────
-
 async def _call_agent(
     prompt_key: str,
     user_content: str,
@@ -116,11 +112,12 @@ async def _call_agent(
     if extra_system_instruction:
         system_prompt = f"{system_prompt.strip()}\n\n{extra_system_instruction.strip()}"
     backoff = [2, 4, 8]
-    last_error = None
+    last_error: Exception | AgentCallError | None = None
 
     for attempt in range(max_retries):
+        key_idx: int | None = None
         try:
-            api_key, key_idx = km.get_active_key()
+            api_key, key_idx = await km.await_active_key()
             client = genai.Client(api_key=api_key)
 
             config = types.GenerateContentConfig(
@@ -137,7 +134,6 @@ async def _call_agent(
                 config=config,
             )
 
-            # Check for safety blocks
             if not response.candidates or not response.candidates[0].content:
                 if response.prompt_feedback and response.prompt_feedback.block_reason:
                     reason = response.prompt_feedback.block_reason
@@ -156,9 +152,7 @@ async def _call_agent(
                     )
                 raise AgentCallError("empty_response", "Provider returned an empty response.")
 
-            # Parse JSON
             text = response.text.strip()
-            # Remove MD code blocks if present
             if text.startswith("```json"):
                 text = text.replace("```json", "", 1).replace("```", "", 1).strip()
             elif text.startswith("```"):
@@ -166,7 +160,6 @@ async def _call_agent(
 
             parsed = json.loads(text)
 
-            # Extract token usage
             usage = {}
             if hasattr(response, "usage_metadata") and response.usage_metadata:
                 usage = {
@@ -177,30 +170,32 @@ async def _call_agent(
             return parsed, usage
 
         except json.JSONDecodeError as e:
-            logger.warning(f"Agent {prompt_key} attempt {attempt+1}: JSON parse error — {e}")
+            logger.warning(f"Agent {prompt_key} attempt {attempt + 1}: JSON parse error - {e}")
             last_error = e
         except AgentCallError as e:
             if e.kind == "safety_block":
                 raise e
             last_error = e
         except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "Resource has been exhausted" in error_str:
-                km.report_error(key_idx, "429")
-                if attempt < max_retries - 1:
-                    logger.warning(f"Agent {prompt_key} attempt {attempt+1}: 429 rate limit. Backoff {backoff[attempt]}s")
-                    await asyncio.sleep(backoff[attempt])
-                    continue
-                raise AgentCallError("rate_limit", "Provider rate limit encountered.")
-            elif "500" in error_str:
-                km.report_error(key_idx, "500")
+            transient_kind = classify_transient_provider_error(e)
+            if transient_kind and key_idx is not None:
+                km.report_error(key_idx, transient_kind)
+                logger.warning(
+                    "Agent %s attempt %s: transient %s on key %s: %s",
+                    prompt_key,
+                    attempt + 1,
+                    transient_kind,
+                    key_idx,
+                    e,
+                )
+                if transient_kind == "429" and attempt >= max_retries - 1:
+                    raise AgentCallError("rate_limit", "Provider rate limit encountered.")
             else:
-                logger.warning(f"Agent {prompt_key} attempt {attempt+1}: {e}")
+                logger.warning(f"Agent {prompt_key} attempt {attempt + 1}: {e}")
             last_error = e
-            km.advance_index()
 
         if attempt < max_retries - 1:
-            await asyncio.sleep(backoff[attempt])
+            await asyncio.sleep(jittered_delay(backoff[attempt]))
 
     logger.error(f"Agent {prompt_key}: all {max_retries} retries failed. Last error: {last_error}")
     if isinstance(last_error, AgentCallError):
@@ -220,8 +215,6 @@ async def _call_agent(
         f"Provider call failed after {max_retries} attempts.",
     )
 
-
-# ── Agent classes ──────────────────────────────────────────────────────
 
 class EntityArchitectAgent:
     """Extracts entities from a chunk."""
@@ -256,11 +249,12 @@ class RelationshipArchitectAgent:
         settings = load_settings()
         model = settings.get("default_model_flash", "gemini-flash-lite-latest")
 
-        # Combine the chunk text and the extracted entities so it knows what it can use
-        user_content = json.dumps({
-            "chunk_text": prefixed_chunk_text,
-            "extracted_entities": [n.model_dump() for n in entities]
-        })
+        user_content = json.dumps(
+            {
+                "chunk_text": prefixed_chunk_text,
+                "extracted_entities": [n.model_dump() for n in entities],
+            }
+        )
 
         parsed, usage = await _call_agent(
             prompt_key="relationship_architect_prompt",
@@ -310,7 +304,7 @@ class GraphArchitectAgent:
         self,
         extraction_chunk_text: str,
         previous_nodes: list[NodeOut],
-        previous_edges: list[EdgeOut]
+        previous_edges: list[EdgeOut],
     ) -> tuple[GraphArchitectOutput, dict]:
         settings = load_settings()
         model = settings.get("default_model_flash", "gemini-flash-lite-latest")
@@ -380,14 +374,16 @@ class ScribeAgent:
         settings = load_settings()
         model = settings.get("default_model_scribe", "gemini-2.5-pro-preview-05-06")
 
-        user_content = json.dumps({
-            "graph_output": {
-                "nodes": [n.model_dump() for n in nodes],
-                "edges": [e.model_dump() for e in edges]
-            },
-            "claim_output": claim_output.model_dump(),
-            "chunk_text": chunk_text,
-        })
+        user_content = json.dumps(
+            {
+                "graph_output": {
+                    "nodes": [n.model_dump() for n in nodes],
+                    "edges": [e.model_dump() for e in edges],
+                },
+                "claim_output": claim_output.model_dump(),
+                "chunk_text": chunk_text,
+            }
+        )
 
         parsed, usage = await _call_agent(
             prompt_key="scribe_prompt",
@@ -397,7 +393,6 @@ class ScribeAgent:
         )
 
         if not parsed:
-            # Fallback: pass through unmerged
             return ScribeOutput(
                 merged_nodes=[n.model_copy() for n in nodes],
                 merged_edges=[e.model_copy() for e in edges],

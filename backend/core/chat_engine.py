@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Generator
 
@@ -12,7 +13,7 @@ from google.genai import types
 
 from .config import load_prompt, load_settings
 from .intenserp_provider import stream_intenserp_chat
-from .key_manager import get_key_manager
+from .key_manager import classify_transient_provider_error, get_key_manager, jittered_delay
 from .retrieval_engine import RetrievalEngine
 
 logger = logging.getLogger(__name__)
@@ -159,10 +160,6 @@ def stream_chat(
                 yield chunk
             return
 
-        km = get_key_manager()
-        api_key, _ = km.get_active_key()
-        client = genai.Client(api_key=api_key)
-
         disable_safety = settings.get("disable_safety_filters", False)
         safety_settings = None
         if disable_safety:
@@ -179,23 +176,45 @@ def stream_chat(
             safety_settings=safety_settings,
         )
 
-        response = client.models.generate_content_stream(
-            model=model_name,
-            contents=gemini_sdk_contents,
-            config=config,
-        )
+        km = get_key_manager()
+        backoff = [2, 4, 8]
+        max_retries = 3
 
-        for chunk in response:
-            if chunk.text:
-                yield f"data: {json.dumps({'token': chunk.text})}\n\n"
+        for attempt in range(max_retries):
+            key_idx: int | None = None
+            emitted_token = False
+            try:
+                api_key, key_idx = km.wait_for_available_key()
+                client = genai.Client(api_key=api_key)
+                response = client.models.generate_content_stream(
+                    model=model_name,
+                    contents=gemini_sdk_contents,
+                    config=config,
+                )
 
-        done_payload = {
-            "event": "done",
-            "nodes_used": nodes_used,
-            "context_payload": gemini_context_payload,
-            "context_meta": gemini_context_meta,
-        }
-        yield f"data: {json.dumps(done_payload)}\n\n"
+                for chunk in response:
+                    if chunk.text:
+                        emitted_token = True
+                        yield f"data: {json.dumps({'token': chunk.text})}\n\n"
+
+                done_payload = {
+                    "event": "done",
+                    "nodes_used": nodes_used,
+                    "context_payload": gemini_context_payload,
+                    "context_meta": gemini_context_meta,
+                }
+                yield f"data: {json.dumps(done_payload)}\n\n"
+                return
+            except Exception as e:
+                if emitted_token:
+                    raise
+                transient_kind = classify_transient_provider_error(e)
+                if transient_kind and key_idx is not None:
+                    km.report_error(key_idx, transient_kind)
+                    if attempt < max_retries - 1:
+                        time.sleep(jittered_delay(backoff[attempt]))
+                        continue
+                raise
 
     except Exception as e:
         logger.exception("Chat stream error for world %s", world_id)

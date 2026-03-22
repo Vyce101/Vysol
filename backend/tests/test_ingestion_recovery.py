@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
@@ -328,6 +329,7 @@ def test_build_chunk_plan_respects_stage_retry_modes():
     }
 
     embedding_only = ingestion_engine._build_chunk_plan(
+        "world-1",
         source,
         chunks_total=5,
         resume=True,
@@ -338,6 +340,7 @@ def test_build_chunk_plan_respects_stage_retry_modes():
     assert embedding_only == {2: "embedding_only"}
 
     all_modes = ingestion_engine._build_chunk_plan(
+        "world-1",
         source,
         chunks_total=5,
         resume=True,
@@ -425,6 +428,7 @@ def test_retry_endpoint_rejects_when_only_stale_failures_exist(monkeypatch):
     monkeypatch.setattr(ingestion_router, "recover_stale_ingestion", lambda world_id: meta)
     monkeypatch.setattr(ingestion_router, "has_active_ingestion_run", lambda world_id: False)
     monkeypatch.setattr(ingestion_router, "audit_ingestion_integrity", fake_audit)
+    monkeypatch.setattr(ingestion_router, "list_safety_reviews", lambda world_id: [])
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(
@@ -735,11 +739,59 @@ def test_active_checkpoint_reports_embedding_phase_progress_for_reembed_all(monk
     assert checkpoint["chunks_total"] == 3
 
 
+def test_get_checkpoint_info_includes_live_wait_snapshot(monkeypatch):
+    meta = {
+        "world_id": "world-1",
+        "ingestion_status": "in_progress",
+        "ingestion_operation": "default",
+        "ingestion_wait": {
+            "wait_state": "waiting_for_api_key",
+            "wait_stage": "embedding",
+            "wait_label": "Waiting for API key cooldown",
+            "wait_retry_after_seconds": 12.5,
+        },
+        "sources": [
+            {
+                "source_id": "source-a",
+                "book_number": 1,
+                "display_name": "Book 1",
+                "chunk_count": 4,
+                "status": "ingesting",
+                "failed_chunks": [],
+                "stage_failures": [],
+                "extracted_chunks": [0, 1],
+                "embedded_chunks": [0],
+            }
+        ],
+    }
+    _patch_meta_store(monkeypatch, meta)
+    monkeypatch.setattr(ingestion_engine, "_active_runs", {"world-1": object()})
+    monkeypatch.setattr(
+        ingestion_engine,
+        "audit_ingestion_integrity",
+        lambda world_id, synthesize_failures=False, persist=True: {"world": {"embedded_chunks": 1}, "failures": []},
+    )
+    monkeypatch.setattr(ingestion_engine, "_load_checkpoint", lambda world_id: None)
+
+    checkpoint = ingestion_engine.get_checkpoint_info("world-1")
+
+    assert checkpoint["wait_state"] == "waiting_for_api_key"
+    assert checkpoint["wait_stage"] == "embedding"
+    assert checkpoint["wait_label"] == "Waiting for API key cooldown"
+    assert checkpoint["wait_retry_after_seconds"] == 12.5
+
+
 def test_abort_ingestion_emits_aborting_for_live_run(monkeypatch):
     meta = {
         "world_id": "world-1",
         "ingestion_status": "in_progress",
         "ingestion_operation": "reembed_all",
+        "ingestion_wait": {
+            "wait_state": "waiting_for_api_key",
+            "wait_stage": "embedding",
+            "wait_label": "Waiting for API key cooldown",
+            "wait_retry_after_seconds": 9.0,
+        },
         "sources": [
             {
                 "source_id": "source-a",
@@ -764,9 +816,63 @@ def test_abort_ingestion_emits_aborting_for_live_run(monkeypatch):
 
     assert live_event.is_set() is True
     assert holder["meta"]["ingestion_abort_requested_at"]
+    assert "ingestion_wait" not in holder["meta"]
     events = ingestion_engine.drain_sse_events("world-1")
     assert events[-1]["event"] == "aborting"
     assert events[-1]["progress_phase"] == "aborting"
+    assert events[-1]["wait_state"] is None
+
+
+def test_finish_wait_emits_waiting_event_for_long_wait(monkeypatch):
+    meta = {
+        "world_id": "world-1",
+        "ingestion_status": "in_progress",
+        "ingestion_operation": "default",
+        "ingestion_wait": {
+            "wait_state": "waiting_for_api_key",
+            "wait_stage": "embedding",
+            "wait_label": "Waiting for API key cooldown",
+            "wait_retry_after_seconds": 7.0,
+        },
+        "sources": [],
+    }
+    holder = _patch_meta_store(monkeypatch, meta)
+    monkeypatch.setattr(
+        ingestion_engine,
+        "_active_waits",
+        {
+            "world-1": {
+                "wait-1": {
+                    "wait_state": "waiting_for_api_key",
+                    "wait_stage": "embedding",
+                    "wait_label": "Waiting for API key cooldown",
+                    "wait_retry_after_seconds": 7.0,
+                    "source_id": "source-a",
+                    "book_number": 2,
+                    "chunk_index": 11,
+                    "active_agent": "node_embedding",
+                    "started_monotonic": time.monotonic() - 3.5,
+                }
+            }
+        },
+    )
+
+    asyncio.run(
+        ingestion_engine._finish_wait(
+            "world-1",
+            holder["meta"],
+            asyncio.Lock(),
+            wait_key="wait-1",
+            emit_log=True,
+        )
+    )
+
+    assert "ingestion_wait" not in holder["meta"]
+    events = ingestion_engine.drain_sse_events("world-1")
+    assert events[-1]["event"] == "waiting"
+    assert events[-1]["wait_state"] == "waiting_for_api_key"
+    assert events[-1]["chunk_index"] == 11
+    assert events[-1]["wait_duration_seconds"] >= 2.0
 
 
 def test_stage_scheduler_abort_wakes_waiter_during_cooldown():

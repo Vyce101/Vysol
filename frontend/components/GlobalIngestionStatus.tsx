@@ -26,6 +26,10 @@ interface CheckpointInfo {
     total_chunks_current_phase?: number;
     progress_percent?: number;
     active_operation?: string;
+    wait_state?: "queued_for_extraction_slot" | "queued_for_embedding_slot" | "waiting_for_api_key" | null;
+    wait_stage?: "extracting" | "embedding" | null;
+    wait_label?: string | null;
+    wait_retry_after_seconds?: number | null;
 }
 
 interface ActiveWorldProgress {
@@ -37,6 +41,8 @@ interface ActiveWorldProgress {
     percent: number;
     phase: "extracting" | "embedding" | "aborting" | "idle";
     operation: string;
+    wait_label: string | null;
+    wait_retry_after_seconds: number | null;
 }
 
 const STORAGE_KEY = "global-ingestion-status-expanded";
@@ -130,6 +136,8 @@ export function GlobalIngestionStatus() {
                                 ingestion_status: world.ingestion_status,
                                 phase: checkpoint?.progress_phase || "idle",
                                 operation: checkpoint?.active_operation || "default",
+                                wait_label: checkpoint?.wait_label || null,
+                                wait_retry_after_seconds: checkpoint?.wait_retry_after_seconds ?? null,
                                 ...progress,
                             };
                         }),
@@ -287,7 +295,14 @@ export function GlobalIngestionStatus() {
                                         <div style={{ fontSize: 12, color: "var(--text-subtle)" }}>
                                             {world.phase === "aborting"
                                                 ? "Aborting..."
-                                                : `${world.completed_chunks}/${world.total_chunks || "?"} chunks`}
+                                                : world.wait_label
+                                                    ? world.wait_label
+                                                    : `${world.completed_chunks}/${world.total_chunks || "?"} chunks`}
+                                            {world.wait_label && world.wait_retry_after_seconds && (
+                                                <span style={{ display: "block", marginTop: 2 }}>
+                                                    About {Math.max(1, Math.ceil(world.wait_retry_after_seconds))}s remaining.
+                                                </span>
+                                            )}
                                         </div>
                                     </div>
                                     <div style={{

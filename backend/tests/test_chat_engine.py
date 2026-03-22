@@ -59,7 +59,7 @@ def test_stream_chat_gemini_emits_exact_context_payload_and_separate_meta(monkey
             }
 
     class DummyKM:
-        def get_active_key(self):
+        def wait_for_available_key(self, *, jitter_seconds: float = 0.25):
             return ("test-key", "key-1")
 
     captured = {}
@@ -203,3 +203,149 @@ def test_stream_chat_intenserp_emits_exact_context_payload_and_separate_meta(mon
     assert "context_meta" not in done["context_payload"]
     assert "visualization" not in done["context_payload"]
     assert "captured_at" in done["context_meta"]
+
+
+def test_stream_chat_gemini_retries_transient_failure_before_first_token(monkeypatch):
+    class DummyRetriever:
+        def __init__(self, world_id: str):
+            self.world_id = world_id
+
+        def retrieve(self, query: str, settings_override=None):
+            return {
+                "context_string": "",
+                "graph_nodes": [],
+                "retrieval_meta": {},
+                "context_graph": None,
+            }
+
+    class DummyKM:
+        def __init__(self):
+            self.calls = 0
+            self.reported: list[tuple[int, str]] = []
+
+        def wait_for_available_key(self, *, jitter_seconds: float = 0.25):
+            keys = [("k1", 0), ("k2", 1)]
+            key = keys[min(self.calls, len(keys) - 1)]
+            self.calls += 1
+            return key
+
+        def report_error(self, key_index: int, error_type: str) -> None:
+            self.reported.append((key_index, error_type))
+
+    class FailingResponse:
+        def __iter__(self):
+            raise RuntimeError("request timed out")
+            yield  # pragma: no cover
+
+    class SuccessfulResponse:
+        def __iter__(self):
+            class Chunk:
+                text = "hello"
+
+            yield Chunk()
+
+    class DummyModels:
+        def __init__(self, api_key: str):
+            self.api_key = api_key
+
+        def generate_content_stream(self, *, model, contents, config):
+            if self.api_key == "k1":
+                return FailingResponse()
+            return SuccessfulResponse()
+
+    class DummyClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels(api_key)
+
+    dummy_km = DummyKM()
+
+    monkeypatch.setattr(chat_engine, "RetrievalEngine", DummyRetriever)
+    monkeypatch.setattr(chat_engine, "load_prompt", lambda key: "BASE SYSTEM")
+    monkeypatch.setattr(
+        chat_engine,
+        "load_settings",
+        lambda: {
+            "chat_provider": "gemini",
+            "default_model_chat": "gemini-test-model",
+            "chat_history_messages": 10,
+        },
+    )
+    monkeypatch.setattr(chat_engine, "get_key_manager", lambda: dummy_km)
+    monkeypatch.setattr(chat_engine.genai, "Client", DummyClient)
+    monkeypatch.setattr(chat_engine.time, "sleep", lambda seconds: None)
+
+    events = _parse_sse_events(list(chat_engine.stream_chat("world-123", "hello")))
+
+    assert [event.get("token") for event in events if "token" in event] == ["hello"]
+    assert events[-1]["event"] == "done"
+    assert dummy_km.reported == [(0, "timeout")]
+
+
+def test_stream_chat_gemini_does_not_retry_after_first_token(monkeypatch):
+    class DummyRetriever:
+        def __init__(self, world_id: str):
+            self.world_id = world_id
+
+        def retrieve(self, query: str, settings_override=None):
+            return {
+                "context_string": "",
+                "graph_nodes": [],
+                "retrieval_meta": {},
+                "context_graph": None,
+            }
+
+    class DummyKM:
+        def __init__(self):
+            self.calls = 0
+            self.reported: list[tuple[int, str]] = []
+
+        def wait_for_available_key(self, *, jitter_seconds: float = 0.25):
+            keys = [("k1", 0), ("k2", 1)]
+            key = keys[min(self.calls, len(keys) - 1)]
+            self.calls += 1
+            return key
+
+        def report_error(self, key_index: int, error_type: str) -> None:
+            self.reported.append((key_index, error_type))
+
+    class PartialFailureResponse:
+        def __iter__(self):
+            class Chunk:
+                text = "hello"
+
+            yield Chunk()
+            raise RuntimeError("request timed out")
+
+    class DummyModels:
+        def __init__(self, api_key: str):
+            self.api_key = api_key
+
+        def generate_content_stream(self, *, model, contents, config):
+            return PartialFailureResponse()
+
+    class DummyClient:
+        def __init__(self, api_key: str):
+            self.models = DummyModels(api_key)
+
+    dummy_km = DummyKM()
+
+    monkeypatch.setattr(chat_engine, "RetrievalEngine", DummyRetriever)
+    monkeypatch.setattr(chat_engine, "load_prompt", lambda key: "BASE SYSTEM")
+    monkeypatch.setattr(
+        chat_engine,
+        "load_settings",
+        lambda: {
+            "chat_provider": "gemini",
+            "default_model_chat": "gemini-test-model",
+            "chat_history_messages": 10,
+        },
+    )
+    monkeypatch.setattr(chat_engine, "get_key_manager", lambda: dummy_km)
+    monkeypatch.setattr(chat_engine.genai, "Client", DummyClient)
+
+    events = _parse_sse_events(list(chat_engine.stream_chat("world-123", "hello")))
+
+    assert events[0]["token"] == "hello"
+    assert events[-1]["event"] == "error"
+    assert dummy_km.calls == 1
+    assert dummy_km.reported == []

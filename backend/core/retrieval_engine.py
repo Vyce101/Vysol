@@ -94,7 +94,7 @@ class RetrievalEngine:
 
         # Step 1: Embed query once and validate retrieval health.
         km = get_key_manager()
-        api_key, _ = km.get_active_key()
+        api_key, _ = km.wait_for_available_key()
         query_embedding = self.chunk_vector_store.embed_text(query, api_key)
         chunk_vector_count = self.chunk_vector_store.count()
         unique_node_vector_count = self.unique_node_vector_store.count()

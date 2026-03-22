@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal
 
@@ -24,7 +25,7 @@ from .config import (
 )
 from .entity_text import build_unique_node_document
 from .graph_store import GraphStore
-from .key_manager import get_key_manager
+from .key_manager import AllKeysInCooldownError, get_key_manager, jittered_delay
 from .temporal_indexer import TemporalChunk, stamp_chunks
 from .vector_store import VectorStore
 
@@ -42,6 +43,8 @@ _sse_locks: dict[str, threading.Lock] = {}
 _graph_locks: dict[str, asyncio.Lock] = {}
 _vector_locks: dict[str, asyncio.Lock] = {}
 _meta_locks: dict[str, asyncio.Lock] = {}
+_active_waits: dict[str, dict[str, dict[str, Any]]] = {}
+_active_waits_lock = threading.RLock()
 
 RetryStage = Literal["extraction", "embedding", "all"]
 ChunkMode = Literal["full", "full_cleanup", "embedding_only"]
@@ -49,8 +52,16 @@ IngestOperation = Literal["default", "rechunk_reingest", "reembed_all"]
 FailureScope = Literal["chunk", "node"]
 SafetyReviewStatus = Literal["blocked", "draft", "testing", "resolved"]
 SafetyReviewOutcome = Literal["not_tested", "still_safety_blocked", "transient_failure", "other_failure", "passed"]
+WaitState = Literal["queued_for_extraction_slot", "queued_for_embedding_slot", "waiting_for_api_key"]
+WaitStage = Literal["extracting", "embedding"]
 _STALE_RUN_GRACE_SECONDS = 15
 _UNIQUE_NODE_VECTOR_BATCH_SIZE = 8
+_WAIT_LOG_THRESHOLD_SECONDS = 2.0
+_WAIT_STATE_PRIORITY: dict[str, int] = {
+    "queued_for_extraction_slot": 1,
+    "queued_for_embedding_slot": 2,
+    "waiting_for_api_key": 3,
+}
 
 
 class ExtractionCoverageError(RuntimeError):
@@ -74,6 +85,17 @@ class _StageScheduler:
             while len(self._slots) < self._concurrency:
                 self._slots.append({"busy": False, "available_at": 0.0})
             self._condition.notify_all()
+
+    async def try_acquire(self) -> int | None:
+        async with self._condition:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            for index in range(self._concurrency):
+                slot = self._slots[index]
+                if not slot["busy"] and float(slot["available_at"]) <= now:
+                    slot["busy"] = True
+                    return index
+        return None
 
     async def acquire(self, abort_event: threading.Event) -> int:
         while True:
@@ -175,6 +197,239 @@ def _mark_ingestion_live(
 def _mark_ingestion_terminal(meta: dict, status: str) -> None:
     meta["ingestion_status"] = status
     meta["ingestion_updated_at"] = _now_iso()
+    meta.pop("ingestion_wait", None)
+    meta.pop("ingestion_abort_requested_at", None)
+
+
+def _blank_wait_fields() -> dict[str, Any]:
+    return {
+        "wait_state": None,
+        "wait_stage": None,
+        "wait_label": None,
+        "wait_retry_after_seconds": None,
+    }
+
+
+def _wait_label_for(wait_state: str | None) -> str | None:
+    if wait_state == "queued_for_extraction_slot":
+        return "Queued for extraction slot"
+    if wait_state == "queued_for_embedding_slot":
+        return "Queued for embedding slot"
+    if wait_state == "waiting_for_api_key":
+        return "Waiting for API key cooldown"
+    return None
+
+
+def _serialize_wait_snapshot(snapshot: dict | None) -> dict | None:
+    if not snapshot:
+        return None
+    retry_after = snapshot.get("wait_retry_after_seconds")
+    if retry_after is not None:
+        try:
+            retry_after = max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            retry_after = None
+    return {
+        "wait_state": snapshot.get("wait_state"),
+        "wait_stage": snapshot.get("wait_stage"),
+        "wait_label": snapshot.get("wait_label"),
+        "wait_retry_after_seconds": retry_after,
+    }
+
+
+def _wait_fields_from_meta(meta: dict) -> dict[str, Any]:
+    raw = meta.get("ingestion_wait")
+    if not isinstance(raw, dict):
+        return _blank_wait_fields()
+    return {
+        "wait_state": raw.get("wait_state"),
+        "wait_stage": raw.get("wait_stage"),
+        "wait_label": raw.get("wait_label"),
+        "wait_retry_after_seconds": raw.get("wait_retry_after_seconds"),
+    }
+
+
+def _set_wait_snapshot(meta: dict, snapshot: dict | None) -> bool:
+    next_payload = _serialize_wait_snapshot(snapshot)
+    current_payload = _serialize_wait_snapshot(meta.get("ingestion_wait") if isinstance(meta.get("ingestion_wait"), dict) else None)
+    if current_payload == next_payload:
+        return False
+    if next_payload is None:
+        meta.pop("ingestion_wait", None)
+    else:
+        meta["ingestion_wait"] = next_payload
+    return True
+
+
+def _select_representative_wait_unlocked(world_id: str) -> dict | None:
+    waits = list(_active_waits.get(world_id, {}).values())
+    if not waits:
+        return None
+
+    def wait_sort_key(entry: dict) -> tuple[int, float]:
+        return (
+            int(_WAIT_STATE_PRIORITY.get(str(entry.get("wait_state") or ""), 0)),
+            -float(entry.get("started_monotonic") or 0.0),
+        )
+
+    active_wait = max(waits, key=wait_sort_key)
+    return _serialize_wait_snapshot(active_wait)
+
+
+def _clear_active_waits(world_id: str) -> None:
+    with _active_waits_lock:
+        _active_waits.pop(world_id, None)
+
+
+async def _sync_wait_snapshot(world_id: str, meta: dict, meta_lock: asyncio.Lock) -> None:
+    with _active_waits_lock:
+        snapshot = _select_representative_wait_unlocked(world_id)
+    async with meta_lock:
+        if _set_wait_snapshot(meta, snapshot):
+            if meta.get("ingestion_status") == "in_progress":
+                meta["ingestion_updated_at"] = _now_iso()
+            _save_meta(world_id, meta)
+
+
+async def _begin_wait(
+    world_id: str,
+    meta: dict,
+    meta_lock: asyncio.Lock,
+    *,
+    wait_key: str,
+    wait_state: WaitState,
+    wait_stage: WaitStage,
+    source_id: str | None,
+    book_number: int | None,
+    chunk_index: int | None,
+    active_agent: str | None,
+    wait_retry_after_seconds: float | None = None,
+) -> None:
+    with _active_waits_lock:
+        world_waits = _active_waits.setdefault(world_id, {})
+        world_waits[wait_key] = {
+            "wait_state": wait_state,
+            "wait_stage": wait_stage,
+            "wait_label": _wait_label_for(wait_state),
+            "wait_retry_after_seconds": None if wait_retry_after_seconds is None else max(0.0, float(wait_retry_after_seconds)),
+            "source_id": source_id,
+            "book_number": book_number,
+            "chunk_index": chunk_index,
+            "active_agent": active_agent,
+            "started_monotonic": time.monotonic(),
+        }
+    await _sync_wait_snapshot(world_id, meta, meta_lock)
+    push_sse_event(
+        world_id,
+        {
+            "event": "status",
+            "source_id": source_id,
+            "book_number": book_number,
+            "chunk_index": chunk_index,
+            "active_agent": active_agent,
+            **_build_progress_event(
+                world_id,
+                meta,
+                source_id=source_id,
+                active_agent=active_agent,
+            ),
+        },
+    )
+
+
+async def _update_wait_retry_after(
+    world_id: str,
+    meta: dict,
+    meta_lock: asyncio.Lock,
+    *,
+    wait_key: str,
+    wait_retry_after_seconds: float | None,
+) -> None:
+    with _active_waits_lock:
+        wait_entry = _active_waits.get(world_id, {}).get(wait_key)
+        if wait_entry is None:
+            return
+        next_retry = None if wait_retry_after_seconds is None else max(0.0, float(wait_retry_after_seconds))
+        current_retry = wait_entry.get("wait_retry_after_seconds")
+        if current_retry == next_retry:
+            return
+        wait_entry["wait_retry_after_seconds"] = next_retry
+        payload = {
+            "source_id": wait_entry.get("source_id"),
+            "book_number": wait_entry.get("book_number"),
+            "chunk_index": wait_entry.get("chunk_index"),
+            "active_agent": wait_entry.get("active_agent"),
+        }
+    await _sync_wait_snapshot(world_id, meta, meta_lock)
+    push_sse_event(
+        world_id,
+        {
+            "event": "status",
+            **payload,
+            **_build_progress_event(
+                world_id,
+                meta,
+                source_id=payload.get("source_id"),
+                active_agent=payload.get("active_agent"),
+            ),
+        },
+    )
+
+
+async def _finish_wait(
+    world_id: str,
+    meta: dict,
+    meta_lock: asyncio.Lock,
+    *,
+    wait_key: str,
+    emit_log: bool,
+) -> None:
+    wait_entry = None
+    with _active_waits_lock:
+        world_waits = _active_waits.get(world_id)
+        if world_waits is not None:
+            wait_entry = world_waits.pop(wait_key, None)
+            if not world_waits:
+                _active_waits.pop(world_id, None)
+    if wait_entry is None:
+        return
+    await _sync_wait_snapshot(world_id, meta, meta_lock)
+    push_sse_event(
+        world_id,
+        {
+            "event": "status",
+            "source_id": wait_entry.get("source_id"),
+            "book_number": wait_entry.get("book_number"),
+            "chunk_index": wait_entry.get("chunk_index"),
+            "active_agent": wait_entry.get("active_agent"),
+            **_build_progress_event(
+                world_id,
+                meta,
+                source_id=wait_entry.get("source_id"),
+                active_agent=wait_entry.get("active_agent"),
+            ),
+        },
+    )
+    if not emit_log:
+        return
+    wait_duration_seconds = max(0.0, time.monotonic() - float(wait_entry.get("started_monotonic") or 0.0))
+    if wait_duration_seconds < _WAIT_LOG_THRESHOLD_SECONDS:
+        return
+    push_sse_event(
+        world_id,
+        {
+            "event": "waiting",
+            "source_id": wait_entry.get("source_id"),
+            "book_number": wait_entry.get("book_number"),
+            "chunk_index": wait_entry.get("chunk_index"),
+            "active_agent": wait_entry.get("active_agent"),
+            "wait_state": wait_entry.get("wait_state"),
+            "wait_stage": wait_entry.get("wait_stage"),
+            "wait_label": wait_entry.get("wait_label"),
+            "wait_retry_after_seconds": wait_entry.get("wait_retry_after_seconds"),
+            "wait_duration_seconds": wait_duration_seconds,
+        },
+    )
 
 
 def _progress_source(meta: dict, source_id: str | None = None) -> dict | None:
@@ -235,6 +490,7 @@ def _build_progress_snapshot(
 
     completed = max(0, min(completed, chunk_count)) if chunk_count > 0 else 0
     percent = (completed / chunk_count * 100.0) if chunk_count > 0 else 0.0
+    wait_fields = _wait_fields_from_meta(meta)
 
     return {
         "progress_phase": phase,
@@ -242,6 +498,7 @@ def _build_progress_snapshot(
         "total_chunks_current_phase": chunk_count,
         "progress_percent": percent,
         "active_operation": active_operation,
+        **wait_fields,
     }
 
 
@@ -754,6 +1011,7 @@ def recover_stale_ingestion(world_id: str) -> dict:
         and int(world_summary.get("expected_chunks", 0)) == int(world_summary.get("embedded_chunks", 0))
         and int(world_summary.get("failed_records", 0)) == 0
     )
+    _clear_active_waits(world_id)
     _mark_ingestion_terminal(refreshed, "complete" if is_complete else "partial_failure")
     refreshed["ingestion_recovered_at"] = refreshed["ingestion_updated_at"]
     _save_meta(world_id, refreshed)
@@ -2228,6 +2486,7 @@ async def start_ingestion(
     my_event = threading.Event()
     _abort_events[world_id] = my_event
     _active_runs[world_id] = my_event
+    _clear_active_waits(world_id)
 
     operation_norm = _normalize_ingest_operation(operation)
     retry_stage_norm = _normalize_retry_stage(retry_stage)
@@ -2238,6 +2497,7 @@ async def start_ingestion(
     is_full_rebuild = operation_norm == "rechunk_reingest" or (not resume and operation_norm == "default")
     is_reembed_all = operation_norm == "reembed_all"
     meta.pop("ingestion_abort_requested_at", None)
+    meta.pop("ingestion_wait", None)
 
     if is_full_rebuild or is_reembed_all:
         review_guard = get_safety_review_rebuild_guard(world_id)
@@ -2352,6 +2612,100 @@ async def start_ingestion(
         vector_lock = _get_async_lock(world_id, _vector_locks)
         meta_lock = _get_async_lock(world_id, _meta_locks)
 
+        async def acquire_stage_slot(
+            scheduler: _StageScheduler,
+            *,
+            wait_state: Literal["queued_for_extraction_slot", "queued_for_embedding_slot"],
+            wait_stage: WaitStage,
+            source_id: str | None,
+            book_number: int | None,
+            chunk_index: int | None,
+            active_agent: str,
+        ) -> int:
+            slot = await scheduler.try_acquire()
+            if slot is not None:
+                return slot
+
+            wait_key = f"{source_id or 'world'}:{book_number if book_number is not None else 'na'}:{chunk_index if chunk_index is not None else 'na'}:{wait_state}"
+            await _begin_wait(
+                world_id,
+                meta,
+                meta_lock,
+                wait_key=wait_key,
+                wait_state=wait_state,
+                wait_stage=wait_stage,
+                source_id=source_id,
+                book_number=book_number,
+                chunk_index=chunk_index,
+                active_agent=active_agent,
+            )
+            acquired = False
+            try:
+                slot = await scheduler.acquire(my_event)
+                acquired = True
+                return slot
+            finally:
+                await _finish_wait(
+                    world_id,
+                    meta,
+                    meta_lock,
+                    wait_key=wait_key,
+                    emit_log=acquired and not my_event.is_set() and _is_current_run(world_id, my_event),
+                )
+
+        async def acquire_gemini_key(
+            *,
+            source_id: str | None,
+            book_number: int | None,
+            chunk_index: int | None,
+            active_agent: str,
+        ) -> tuple[str, int]:
+            km = get_key_manager()
+            wait_key = f"{source_id or 'world'}:{book_number if book_number is not None else 'na'}:{chunk_index if chunk_index is not None else 'na'}:waiting_for_api_key:{active_agent}"
+            wait_started = False
+            acquired = False
+            try:
+                while True:
+                    _ensure_not_aborted(world_id, my_event)
+                    try:
+                        api_key, key_index = km.get_active_key()
+                        acquired = True
+                        return api_key, key_index
+                    except AllKeysInCooldownError as exc:
+                        if not wait_started:
+                            await _begin_wait(
+                                world_id,
+                                meta,
+                                meta_lock,
+                                wait_key=wait_key,
+                                wait_state="waiting_for_api_key",
+                                wait_stage="embedding",
+                                source_id=source_id,
+                                book_number=book_number,
+                                chunk_index=chunk_index,
+                                active_agent=active_agent,
+                                wait_retry_after_seconds=exc.retry_after_seconds,
+                            )
+                            wait_started = True
+                        else:
+                            await _update_wait_retry_after(
+                                world_id,
+                                meta,
+                                meta_lock,
+                                wait_key=wait_key,
+                                wait_retry_after_seconds=exc.retry_after_seconds,
+                            )
+                        await asyncio.sleep(jittered_delay(exc.retry_after_seconds))
+            finally:
+                if wait_started:
+                    await _finish_wait(
+                        world_id,
+                        meta,
+                        meta_lock,
+                        wait_key=wait_key,
+                        emit_log=acquired and not my_event.is_set() and _is_current_run(world_id, my_event),
+                    )
+
         async def process_chunk(
             chunk_idx: int,
             tc: Any,
@@ -2367,6 +2721,11 @@ async def start_ingestion(
             chunk = _chunk_id(world_id, source_id, chunk_idx)
             now = _now_iso()
             node_records_for_embedding: list[dict] = []
+            embedding_wait_agent = (
+                "embedding_rebuild"
+                if is_reembed_all
+                else ("embedding_retry" if mode == "embedding_only" else "node_embedding")
+            )
 
             async with meta_lock:
                 _mark_ingestion_live(meta, operation=operation_norm)
@@ -2375,7 +2734,15 @@ async def start_ingestion(
             if mode in ("full", "full_cleanup"):
                 extraction_slot: int | None = None
                 try:
-                    extraction_slot = await _extraction_scheduler.acquire(my_event)
+                    extraction_slot = await acquire_stage_slot(
+                        _extraction_scheduler,
+                        wait_state="queued_for_extraction_slot",
+                        wait_stage="extracting",
+                        source_id=source_id,
+                        book_number=book_number,
+                        chunk_index=chunk_idx,
+                        active_agent="graph_architect",
+                    )
                     _ensure_not_aborted(world_id, my_event)
 
                     if mode == "full_cleanup":
@@ -2595,14 +2962,26 @@ async def start_ingestion(
             # Embedding stage.
             embedding_slot: int | None = None
             try:
-                embedding_slot = await _embedding_scheduler.acquire(my_event)
+                embedding_slot = await acquire_stage_slot(
+                    _embedding_scheduler,
+                    wait_state="queued_for_embedding_slot",
+                    wait_stage="embedding",
+                    source_id=source_id,
+                    book_number=book_number,
+                    chunk_index=chunk_idx,
+                    active_agent=embedding_wait_agent,
+                )
                 if not node_records_for_embedding:
                     async with graph_lock:
                         node_records_for_embedding = _chunk_node_records(graph_store, chunk)
                 _ensure_not_aborted(world_id, my_event)
 
-                km = get_key_manager()
-                api_key, _ = km.get_active_key()
+                api_key, _ = await acquire_gemini_key(
+                    source_id=source_id,
+                    book_number=book_number,
+                    chunk_index=chunk_idx,
+                    active_agent=embedding_wait_agent,
+                )
                 chunk_embeddings = await asyncio.to_thread(
                     vector_store.embed_texts,
                     [tc.prefixed_text],
@@ -2832,8 +3211,12 @@ async def start_ingestion(
         is_current = _is_current_run(world_id, my_event)
         if not my_event.is_set() and is_current:
             if is_reembed_all:
-                km = get_key_manager()
-                api_key, _ = km.get_active_key()
+                api_key, _ = await acquire_gemini_key(
+                    source_id=None,
+                    book_number=None,
+                    chunk_index=None,
+                    active_agent="node_embedding_rebuild",
+                )
                 await _rebuild_unique_node_vectors(
                     graph_store,
                     unique_node_vector_store,
@@ -2844,6 +3227,7 @@ async def start_ingestion(
             audit = audit_ingestion_integrity(world_id, synthesize_failures=True, persist=True)
             refreshed = _load_meta(world_id)
             has_failures = audit["world"]["failed_records"] > 0
+            _clear_active_waits(world_id)
             _mark_ingestion_terminal(refreshed, "complete" if not has_failures else "partial_failure")
             _save_meta(world_id, refreshed)
             if not has_failures:
@@ -2870,6 +3254,7 @@ async def start_ingestion(
             )
         elif my_event.is_set() and is_current:
             refreshed = _load_meta(world_id)
+            _clear_active_waits(world_id)
             _mark_ingestion_terminal(refreshed, "aborted")
             _save_meta(world_id, refreshed)
             push_sse_event(
@@ -2886,6 +3271,7 @@ async def start_ingestion(
         logger.exception("Ingestion failed for world %s", world_id)
         if _is_current_run(world_id, my_event):
             meta = _load_meta(world_id)
+            _clear_active_waits(world_id)
             _mark_ingestion_terminal(meta, "error")
             _save_meta(world_id, meta)
             push_sse_event(
@@ -2897,6 +3283,7 @@ async def start_ingestion(
                 },
             )
     finally:
+        _clear_active_waits(world_id)
         if _abort_events.get(world_id) is my_event:
             _abort_events.pop(world_id, None)
         if _active_runs.get(world_id) is my_event:
@@ -2913,7 +3300,9 @@ def abort_ingestion(world_id: str) -> None:
         return
     if has_active_ingestion_run(world_id):
         meta["ingestion_abort_requested_at"] = _now_iso()
+        meta.pop("ingestion_wait", None)
         _save_meta(world_id, meta)
+        _clear_active_waits(world_id)
         push_sse_event(
             world_id,
             {
@@ -2928,6 +3317,7 @@ def abort_ingestion(world_id: str) -> None:
         return
     audit_ingestion_integrity(world_id, synthesize_failures=True, persist=True)
     meta = _load_meta(world_id)
+    _clear_active_waits(world_id)
     _mark_ingestion_terminal(meta, "aborted")
     _save_meta(world_id, meta)
     push_sse_event(
@@ -3357,7 +3747,7 @@ async def test_safety_review(world_id: str, review_id: str) -> dict:
     try:
         embedding_slot = await _embedding_scheduler.acquire(dummy_abort_event)
         km = get_key_manager()
-        api_key, _ = km.get_active_key()
+        api_key, _ = await km.await_active_key()
         chunk_embeddings = await asyncio.to_thread(
             vector_store.embed_texts,
             [test_chunk.prefixed_text],

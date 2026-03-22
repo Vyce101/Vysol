@@ -320,7 +320,7 @@ def _combine_exact_match_group(nodes: list[dict[str, Any]]) -> tuple[str, str]:
 
 
 def _get_embedding_api_key() -> str:
-    api_key, _ = get_key_manager().get_active_key()
+    api_key, _ = get_key_manager().wait_for_available_key()
     return api_key
 
 

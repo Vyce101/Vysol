@@ -58,6 +58,10 @@ interface Checkpoint {
     total_chunks_current_phase?: number;
     progress_percent?: number;
     active_operation?: string;
+    wait_state?: "queued_for_extraction_slot" | "queued_for_embedding_slot" | "waiting_for_api_key" | null;
+    wait_stage?: "extracting" | "embedding" | null;
+    wait_label?: string | null;
+    wait_retry_after_seconds?: number | null;
 }
 
 interface IngestSettings {
@@ -117,6 +121,11 @@ interface LogEntry {
     total_chunks_current_phase?: number;
     progress_percent?: number;
     active_operation?: string;
+    wait_state?: "queued_for_extraction_slot" | "queued_for_embedding_slot" | "waiting_for_api_key" | null;
+    wait_stage?: "extracting" | "embedding" | null;
+    wait_label?: string | null;
+    wait_retry_after_seconds?: number | null;
+    wait_duration_seconds?: number;
 }
 
 interface ProgressState {
@@ -126,6 +135,10 @@ interface ProgressState {
     phase: "extracting" | "embedding" | "aborting" | "idle";
     agent: string;
     operation: string;
+    waitState: "queued_for_extraction_slot" | "queued_for_embedding_slot" | "waiting_for_api_key" | null;
+    waitStage: "extracting" | "embedding" | null;
+    waitLabel: string | null;
+    waitRetryAfterSeconds: number | null;
 }
 
 interface SafetyReviewSummary {
@@ -193,6 +206,24 @@ function normalizeGleanAmount(value: unknown): number {
     return Math.min(5, Math.max(0, Math.trunc(parsed)));
 }
 
+function formatAgentLabel(agent?: string | null): string | null {
+    const normalized = String(agent ?? "").trim();
+    if (!normalized) return null;
+    return normalized.replace(/_/g, " ");
+}
+
+function formatWaitReason(waitLabel?: string | null): string {
+    const normalized = String(waitLabel ?? "").trim();
+    if (!normalized) return "for work to resume";
+    if (normalized.startsWith("Queued ")) {
+        return normalized.replace("Queued ", "for ");
+    }
+    if (normalized.startsWith("Waiting ")) {
+        return normalized.replace("Waiting ", "for ");
+    }
+    return normalized;
+}
+
 export default function IngestPage({ params }: { params: Promise<{ worldId: string }> }) {
     const { worldId } = use(params);
     const initialProgress: ProgressState = {
@@ -202,6 +233,10 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
         phase: "idle",
         agent: "",
         operation: "default",
+        waitState: null,
+        waitStage: null,
+        waitLabel: null,
+        waitRetryAfterSeconds: null,
     };
     const [sources, setSources] = useState<Source[]>([]);
     const [checkpoint, setCheckpoint] = useState<Checkpoint | null>(null);
@@ -287,6 +322,10 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
             phase: payload.progress_phase || prev.phase,
             agent: payload.active_agent || payload.agent || prev.agent,
             operation: payload.active_operation || prev.operation,
+            waitState: payload.wait_state ?? null,
+            waitStage: payload.wait_stage ?? null,
+            waitLabel: payload.wait_label ?? null,
+            waitRetryAfterSeconds: payload.wait_retry_after_seconds ?? null,
         }));
     };
 
@@ -387,8 +426,17 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
             `/worlds/${worldId}/ingest/status`,
             (data) => {
                 const entry = data as LogEntry;
-                setLogEntries((prev) => [...prev, entry]);
-                syncProgressFromPayload(entry);
+                const shouldAppendLogEntry = !(
+                    entry.event === "status"
+                    && !entry.message
+                    && !isTerminalIngestionStatus(entry.ingestion_status)
+                );
+                if (shouldAppendLogEntry) {
+                    setLogEntries((prev) => [...prev, entry]);
+                }
+                if (entry.event !== "waiting") {
+                    syncProgressFromPayload(entry);
+                }
                 if (entry.safety_review_summary) {
                     setSafetyReviewSummary(entry.safety_review_summary);
                 }
@@ -805,6 +853,7 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
             : progress.phase === "extracting"
                 ? "Extraction"
                 : "Progress";
+    const progressStatusLabel = progress.waitLabel || progressLabel;
 
     const agentPipeline = [
         {
@@ -1326,12 +1375,17 @@ export default function IngestPage({ params }: { params: Promise<{ worldId: stri
                                 <div style={{ marginBottom: 24 }}>
                                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                                         <span style={{ fontSize: 14, fontWeight: 600 }}>
-                                            {progressLabel} {progress.completed} of {progress.total}
+                                            {progressStatusLabel} {progress.completed} of {progress.total}
                                         </span>
                                         <span style={{ fontSize: 13, color: "var(--text-subtle)" }}>
                                             {Math.round(progress.percent)}%
                                         </span>
                                     </div>
+                                    {progress.waitRetryAfterSeconds && progress.waitState === "waiting_for_api_key" && (
+                                        <div style={{ fontSize: 12, color: "var(--text-subtle)", marginBottom: 8 }}>
+                                            Cooldown window is currently about {Math.max(1, Math.ceil(progress.waitRetryAfterSeconds))}s.
+                                        </div>
+                                    )}
                                     <div style={{ height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
                                         <div style={{
                                             height: "100%",
@@ -1558,6 +1612,11 @@ function LogEntryRow({ entry, onViewBlocked }: { entry: LogEntry, onViewBlocked:
     const isPartialComplete = (entry.event === "complete" && entry.status === "partial_failure") || (isStatusEvent && entry.ingestion_status === "partial_failure");
     const isAgentDone = entry.event === "agent_complete";
     const isAborting = entry.event === "aborting";
+    const isWaiting = entry.event === "waiting";
+    const waitDurationSeconds = Math.max(1, Math.round(Number(entry.wait_duration_seconds ?? 0)));
+    const waitMessage = isWaiting
+        ? `Waited ${waitDurationSeconds}s ${formatWaitReason(entry.wait_label)}${formatAgentLabel(entry.active_agent) ? ` before ${formatAgentLabel(entry.active_agent)}` : ""}`
+        : null;
 
     return (
         <div style={{
@@ -1619,6 +1678,7 @@ function LogEntryRow({ entry, onViewBlocked }: { entry: LogEntry, onViewBlocked:
                 {entry.event === "status" && entry.ingestion_status === "complete" && "Ingestion complete!"}
                 {entry.event === "status" && entry.ingestion_status === "partial_failure" && "Retry finished. Some failures remain."}
                 {entry.event === "status" && entry.ingestion_status === "error" && "Ingestion failed."}
+                {isWaiting && waitMessage}
                 {isAborting && "Aborting... waiting for in-flight work to stop."}
                 {entry.event === "aborted" && `Ingestion aborted`}
             </span>
