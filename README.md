@@ -8,6 +8,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB)
 ![Node](https://img.shields.io/badge/node-18%2B-339933)
 ![Status](https://img.shields.io/badge/status-active-success)
+![AI Assisted](https://img.shields.io/badge/AI-assisted-1f6feb)
 
 VySol is an accessible local-first graph RAG app built to make ingestion, graph extraction, entity resolution, embeddings, and chat easy to set up and use in one place.
 
