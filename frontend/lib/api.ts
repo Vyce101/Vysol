@@ -43,6 +43,7 @@ export interface EntityResolutionStatus {
     resolution_mode?: EntityResolutionRunMode;
     include_normalized_exact_pass?: boolean;
     review_mode?: boolean;
+    new_nodes_since_last_completed_resolution?: number | null;
     current_anchor?: {
         node_id?: string;
         display_name?: string;

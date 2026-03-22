@@ -104,10 +104,6 @@ function isRequestResolutionMode(value: unknown): value is EntityResolutionMode 
     return value === "exact_only" || value === "exact_then_ai";
 }
 
-function usesAiResolution(mode?: string) {
-    return mode !== "exact_only";
-}
-
 function formatResolutionMode(mode?: string) {
     if (mode === "exact_only") {
         return "Exact Only";
@@ -116,6 +112,11 @@ function formatResolutionMode(mode?: string) {
         return "Chooser/Combiner Only (Legacy)";
     }
     return "Exact + Chooser/Combiner";
+}
+
+function isCompletedStatus(value?: string) {
+    const normalized = value?.trim().toLowerCase();
+    return normalized === "complete" || normalized === "completed";
 }
 
 export default function EntityResolutionPanel({
@@ -249,15 +250,74 @@ export default function EntityResolutionPanel({
     const triggerLabel = running ? "Monitor Entities" : "Resolve Entities";
     const triggerDisabled = !running && !canResolve;
     const badge = statusBadge(status?.status || (running ? "running" : "idle"));
-    const displayedTopK = typeof status?.top_k === "number" ? status.top_k : topK;
-    const displayedEmbeddingBatchSize = typeof status?.embedding_batch_size === "number"
-        ? Math.max(1, Math.trunc(status.embedding_batch_size))
-        : embeddingBatchSize;
-    const displayedEmbeddingCooldownSeconds = typeof status?.embedding_cooldown_seconds === "number"
-        ? Math.max(0, status.embedding_cooldown_seconds)
-        : embeddingCooldownSeconds;
-    const activeResolutionMode: EntityResolutionRunMode = (status?.resolution_mode as EntityResolutionRunMode | undefined) || resolutionMode;
-    const topKInUse = usesAiResolution(activeResolutionMode);
+    const lastUsedResolutionMode = status?.resolution_mode as EntityResolutionRunMode | undefined;
+    const showExactOnlyOutcomeLabels = isCompletedStatus(status?.status) && lastUsedResolutionMode === "exact_only";
+    const unresolvedMetricTooltip = showExactOnlyOutcomeLabels
+        ? "These entities were checked during exact normalization, but no exact normalized match was found."
+        : undefined;
+    const newNodesValue = typeof status?.new_nodes_since_last_completed_resolution === "number"
+        ? formatCount(status.new_nodes_since_last_completed_resolution)
+        : "Unavailable";
+    const summaryMetrics = [
+        {
+            key: "processed",
+            label: showExactOnlyOutcomeLabels ? "Exact Matches" : "Processed",
+            value: formatCount(status?.resolved_entities as number | undefined),
+            tooltip: undefined,
+        },
+        {
+            key: "remaining",
+            label: showExactOnlyOutcomeLabels ? "Left Unchanged" : "Remaining",
+            value: formatCount(status?.unresolved_entities as number | undefined),
+            tooltip: unresolvedMetricTooltip,
+        },
+        {
+            key: "new_nodes",
+            label: "New Nodes",
+            value: newNodesValue,
+            tooltip: undefined,
+        },
+    ];
+    const lastTopKValue = lastUsedResolutionMode === undefined
+        ? "Not run yet"
+        : lastUsedResolutionMode === "exact_only"
+            ? "Not Used"
+            : typeof status?.top_k === "number"
+                ? formatCount(status.top_k)
+                : "Not run yet";
+    const lastEmbeddingBatchValue = typeof status?.embedding_batch_size === "number"
+        ? formatCount(Math.max(1, Math.trunc(status.embedding_batch_size)))
+        : "Not run yet";
+    const lastEmbeddingDelayValue = typeof status?.embedding_cooldown_seconds === "number"
+        ? `${Math.max(0, status.embedding_cooldown_seconds).toFixed(2)}s`
+        : "Not run yet";
+    const summaryDetails = [
+        {
+            key: "phase",
+            label: "Phase",
+            value: formatTitle((status?.phase as string | undefined) || "waiting"),
+        },
+        {
+            key: "mode",
+            label: "Last Used Mode",
+            value: lastUsedResolutionMode ? formatResolutionMode(lastUsedResolutionMode) : "Not run yet",
+        },
+        {
+            key: "top_k",
+            label: "Last Top K",
+            value: lastTopKValue,
+        },
+        {
+            key: "embed_batch",
+            label: "Last Embedding Batch",
+            value: lastEmbeddingBatchValue,
+        },
+        {
+            key: "embed_delay",
+            label: "Last Embedding Delay",
+            value: lastEmbeddingDelayValue,
+        },
+    ];
     const eventRows = [...logs].reverse();
 
     const handleStart = async () => {
@@ -423,41 +483,198 @@ export default function EntityResolutionPanel({
                                 style={{
                                     display: "flex",
                                     flexWrap: "wrap",
-                                    gap: 12,
+                                    gap: 16,
                                     alignItems: "stretch",
                                 }}
                             >
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Status</div>
-                                    <div style={summaryValueStyle}>{formatTitle(status?.status || (running ? "in_progress" : "idle"))}</div>
+                                <div style={{ ...panelStyle, flex: "1.35 1 460px", minWidth: 0, display: "flex", flexDirection: "column" }}>
+                                    <div style={panelHeaderStyle}>Controls</div>
+                                    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+                                        <div style={{ display: "grid", gap: 12, marginTop: 8 }}>
+                                            <label style={controlLabelStyle}>
+                                                <span style={controlTextStyle}>Resolution mode</span>
+                                                <select
+                                                    value={resolutionMode}
+                                                    onChange={(e) => setResolutionMode(e.target.value as EntityResolutionMode)}
+                                                    disabled={busy || running}
+                                                    style={controlInputStyle}
+                                                >
+                                                    <option value="exact_only">Exact only</option>
+                                                    <option value="exact_then_ai">Exact + chooser/combiner</option>
+                                                </select>
+                                            </label>
+                                            <label style={controlLabelStyle}>
+                                                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                                                    <span style={controlTextStyle}>Top K candidates</span>
+                                                    <span
+                                                        title={resolutionMode === "exact_only"
+                                                            ? "Exact-only runs skip candidate search, so Top K is not used."
+                                                            : "Used for candidate search before chooser/combiner review."}
+                                                        aria-label={resolutionMode === "exact_only"
+                                                            ? "Exact-only runs skip candidate search, so Top K is not used."
+                                                            : "Used for candidate search before chooser/combiner review."}
+                                                        style={summaryInfoIconStyle}
+                                                    >
+                                                        <Info size={12} />
+                                                    </span>
+                                                </span>
+                                                <input
+                                                    type="number"
+                                                    min={1}
+                                                    max={250}
+                                                    value={topK}
+                                                    onChange={(e) => setTopK(Number(e.target.value) || 1)}
+                                                    disabled={busy || running || resolutionMode === "exact_only"}
+                                                    style={controlInputStyle}
+                                                />
+                                            </label>
+                                            <label style={controlLabelStyle}>
+                                                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                                                    <span style={controlTextStyle}>Embedding batch size</span>
+                                                    <span
+                                                        title="Applies to unique-node re-embedding during entity resolution, including exact-only runs."
+                                                        aria-label="Applies to unique-node re-embedding during entity resolution, including exact-only runs."
+                                                        style={summaryInfoIconStyle}
+                                                    >
+                                                        <Info size={12} />
+                                                    </span>
+                                                </span>
+                                                <input
+                                                    type="number"
+                                                    min={1}
+                                                    max={1000}
+                                                    value={embeddingBatchSize}
+                                                    onChange={(e) => setEmbeddingBatchSize(Math.max(1, Number(e.target.value) || 1))}
+                                                    disabled={busy || running}
+                                                    style={controlInputStyle}
+                                                />
+                                            </label>
+                                            <label style={controlLabelStyle}>
+                                                <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                                                    <span style={controlTextStyle}>Embedding delay (seconds)</span>
+                                                    <span
+                                                        title="Wait time between unique-node embedding batches. This does not affect chooser or combiner model calls."
+                                                        aria-label="Wait time between unique-node embedding batches. This does not affect chooser or combiner model calls."
+                                                        style={summaryInfoIconStyle}
+                                                    >
+                                                        <Info size={12} />
+                                                    </span>
+                                                </span>
+                                                <input
+                                                    type="number"
+                                                    min={0}
+                                                    step={0.1}
+                                                    value={embeddingCooldownSeconds}
+                                                    onChange={(e) => setEmbeddingCooldownSeconds(Math.max(0, Number(e.target.value) || 0))}
+                                                    disabled={busy || running}
+                                                    style={controlInputStyle}
+                                                />
+                                            </label>
+                                        </div>
+
+                                        <div style={{ marginTop: "auto", paddingTop: 20 }}>
+                                            <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                                                Entity resolution uses its own per-run embedding batch and delay controls here. These settings do not change ingest or Re-embed All behavior.
+                                            </div>
+
+                                            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
+                                                {!running ? (
+                                                    <button
+                                                        onClick={() => void handleStart()}
+                                                        disabled={!canResolve || busy}
+                                                        style={{
+                                                            ...buttonStyle,
+                                                            background: "var(--primary)",
+                                                            color: "var(--primary-contrast)",
+                                                            opacity: !canResolve || busy ? 0.45 : 1,
+                                                        }}
+                                                    >
+                                                        {busy ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <Play size={14} />}
+                                                        Start Resolution
+                                                    </button>
+                                                ) : (
+                                                    <button
+                                                        onClick={() => void handleAbort()}
+                                                        disabled={busy}
+                                                        style={{
+                                                            ...buttonStyle,
+                                                            background: "var(--status-error-bg)",
+                                                            color: "var(--status-error-fg)",
+                                                            opacity: busy ? 0.45 : 1,
+                                                        }}
+                                                    >
+                                                        {busy ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <AlertTriangle size={14} />}
+                                                        Abort Run
+                                                    </button>
+                                                )}
+
+                                                <button
+                                                    onClick={() => void loadSnapshot(true)}
+                                                    disabled={busy}
+                                                    style={{
+                                                        ...buttonStyle,
+                                                        background: "var(--card)",
+                                                        color: "var(--text-primary)",
+                                                        opacity: busy ? 0.45 : 1,
+                                                    }}
+                                                >
+                                                    <RotateCcw size={14} />
+                                                    Refresh Status
+                                                </button>
+                                            </div>
+
+                                            {error && (
+                                                <div
+                                                    style={{
+                                                        marginTop: 14,
+                                                        padding: "10px 12px",
+                                                        borderRadius: 10,
+                                                        border: "1px solid var(--status-error-soft-border)",
+                                                        background: "var(--status-error-soft-bg)",
+                                                        color: "var(--status-error-fg)",
+                                                        fontSize: 13,
+                                                        lineHeight: 1.5,
+                                                    }}
+                                                >
+                                                    {error}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
                                 </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Phase</div>
-                                    <div style={summaryValueStyle}>{formatTitle((status?.phase as string | undefined) || "waiting")}</div>
-                                </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Mode</div>
-                                    <div style={summaryValueStyle}>{formatResolutionMode(activeResolutionMode)}</div>
-                                </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Resolved</div>
-                                    <div style={summaryValueStyle}>{formatCount(status?.resolved_entities as number | undefined)}</div>
-                                </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Unresolved</div>
-                                    <div style={summaryValueStyle}>{formatCount(status?.unresolved_entities as number | undefined)}</div>
-                                </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Top K</div>
-                                    <div style={summaryValueStyle}>{topKInUse ? formatCount(displayedTopK) : "Not Used"}</div>
-                                </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Embed Batch</div>
-                                    <div style={summaryValueStyle}>{formatCount(displayedEmbeddingBatchSize)}</div>
-                                </div>
-                                <div style={{ ...summaryCardStyle, flex: "1 1 220px" }}>
-                                    <div style={summaryLabelStyle}>Embed Delay</div>
-                                    <div style={summaryValueStyle}>{displayedEmbeddingCooldownSeconds.toFixed(2)}s</div>
+
+                                <div style={{ ...panelStyle, flex: "0.85 1 320px", minWidth: 0, maxWidth: "100%", display: "flex", flexDirection: "column" }}>
+                                    <div style={panelHeaderStyle}>Last Run Summary</div>
+                                    <div style={{ ...summarySurfaceStyle, flex: 1 }}>
+                                        <div style={summaryMetricGridStyle}>
+                                            {summaryMetrics.map((metric) => (
+                                                <div key={metric.key} style={{ minWidth: 0 }}>
+                                                    <div style={summaryMetricLabelRowStyle}>
+                                                        <span style={summaryLabelStyle}>{metric.label}</span>
+                                                        {metric.tooltip && (
+                                                            <span
+                                                                title={metric.tooltip}
+                                                                aria-label={metric.tooltip}
+                                                                style={summaryInfoIconStyle}
+                                                            >
+                                                                <Info size={12} />
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div style={summaryMetricValueStyle}>{metric.value}</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                        <div style={summaryDividerStyle} />
+                                        <div style={summaryDetailsGridStyle}>
+                                            {summaryDetails.map((detail) => (
+                                                <div key={detail.key} style={{ minWidth: 0 }}>
+                                                    <div style={summaryDetailLabelStyle}>{detail.label}</div>
+                                                    <div style={summaryDetailValueStyle}>{detail.value}</div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
 
@@ -509,144 +726,6 @@ export default function EntityResolutionPanel({
                                     </div>
                                 </div>
                             )}
-
-                            <div style={panelStyle}>
-                                <div style={panelHeaderStyle}>Controls</div>
-                                <div
-                                    style={{
-                                        display: "grid",
-                                        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                                        gap: 12,
-                                        marginTop: 8,
-                                    }}
-                                >
-                                    <label style={controlLabelStyle}>
-                                        <span style={controlTextStyle}>Resolution mode</span>
-                                        <select
-                                            value={resolutionMode}
-                                            onChange={(e) => setResolutionMode(e.target.value as EntityResolutionMode)}
-                                            disabled={busy || running}
-                                            style={controlInputStyle}
-                                        >
-                                            <option value="exact_only">Exact only</option>
-                                            <option value="exact_then_ai">Exact + chooser/combiner</option>
-                                        </select>
-                                    </label>
-                                    <label style={controlLabelStyle}>
-                                        <span style={controlTextStyle}>Top K candidates</span>
-                                        <input
-                                            type="number"
-                                            min={1}
-                                            max={250}
-                                            value={topK}
-                                            onChange={(e) => setTopK(Number(e.target.value) || 1)}
-                                            disabled={busy || running || resolutionMode === "exact_only"}
-                                            style={controlInputStyle}
-                                        />
-                                        <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4 }}>
-                                            {resolutionMode === "exact_only"
-                                                ? "Exact-only runs skip candidate search, so Top K is not used."
-                                                : "Used for candidate search before chooser/combiner review."}
-                                        </span>
-                                    </label>
-                                    <label style={controlLabelStyle}>
-                                        <span style={controlTextStyle}>Embedding batch size</span>
-                                        <input
-                                            type="number"
-                                            min={1}
-                                            max={1000}
-                                            value={embeddingBatchSize}
-                                            onChange={(e) => setEmbeddingBatchSize(Math.max(1, Number(e.target.value) || 1))}
-                                            disabled={busy || running}
-                                            style={controlInputStyle}
-                                        />
-                                        <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4 }}>
-                                            Applies to unique-node re-embedding during entity resolution, including exact-only runs.
-                                        </span>
-                                    </label>
-                                    <label style={controlLabelStyle}>
-                                        <span style={controlTextStyle}>Embedding delay (seconds)</span>
-                                        <input
-                                            type="number"
-                                            min={0}
-                                            step={0.1}
-                                            value={embeddingCooldownSeconds}
-                                            onChange={(e) => setEmbeddingCooldownSeconds(Math.max(0, Number(e.target.value) || 0))}
-                                            disabled={busy || running}
-                                            style={controlInputStyle}
-                                        />
-                                        <span style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.4 }}>
-                                            Wait time between unique-node embedding batches. This does not affect chooser or combiner model calls.
-                                        </span>
-                                    </label>
-                                </div>
-                                <div style={{ marginTop: 12, fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
-                                    Entity resolution uses its own per-run embedding batch and delay controls here. These settings do not change ingest or Re-embed All behavior.
-                                </div>
-
-                                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 16 }}>
-                                    {!running ? (
-                                        <button
-                                            onClick={() => void handleStart()}
-                                            disabled={!canResolve || busy}
-                                            style={{
-                                                ...buttonStyle,
-                                                background: "var(--primary)",
-                                                color: "var(--primary-contrast)",
-                                                opacity: !canResolve || busy ? 0.45 : 1,
-                                            }}
-                                        >
-                                            {busy ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <Play size={14} />}
-                                            Start Resolution
-                                        </button>
-                                    ) : (
-                                        <button
-                                            onClick={() => void handleAbort()}
-                                            disabled={busy}
-                                            style={{
-                                                ...buttonStyle,
-                                                background: "var(--status-error-bg)",
-                                                color: "var(--status-error-fg)",
-                                                opacity: busy ? 0.45 : 1,
-                                            }}
-                                        >
-                                            {busy ? <Loader2 size={14} style={{ animation: "spin 1s linear infinite" }} /> : <AlertTriangle size={14} />}
-                                            Abort Run
-                                        </button>
-                                    )}
-
-                                    <button
-                                        onClick={() => void loadSnapshot(true)}
-                                        disabled={busy}
-                                        style={{
-                                            ...buttonStyle,
-                                            background: "var(--card)",
-                                            color: "var(--text-primary)",
-                                            opacity: busy ? 0.45 : 1,
-                                        }}
-                                    >
-                                        <RotateCcw size={14} />
-                                        Refresh Status
-                                    </button>
-                                </div>
-
-                                {error && (
-                                    <div
-                                        style={{
-                                            marginTop: 14,
-                                            padding: "10px 12px",
-                                            borderRadius: 10,
-                                            border: "1px solid var(--status-error-soft-border)",
-                                            background: "var(--status-error-soft-bg)",
-                                            color: "var(--status-error-fg)",
-                                            fontSize: 13,
-                                            lineHeight: 1.5,
-                                        }}
-                                    >
-                                        {error}
-                                    </div>
-                                )}
-                            </div>
 
                             <div style={panelStyle}>
                                 <div style={panelHeaderStyle}>Live Events</div>
@@ -760,24 +839,71 @@ const panelHeaderStyle: React.CSSProperties = {
     fontWeight: 700,
 };
 
-const summaryCardStyle: React.CSSProperties = {
-    border: "1px solid var(--border)",
-    borderRadius: 12,
-    padding: 14,
-    background: "var(--card)",
-};
-
 const summaryLabelStyle: React.CSSProperties = {
     fontSize: 11,
     textTransform: "uppercase",
     letterSpacing: "0.08em",
     color: "var(--text-muted)",
+};
+
+const summarySurfaceStyle: React.CSSProperties = {
+    border: "1px solid var(--border)",
+    borderRadius: 12,
+    padding: 16,
+    background: "var(--background)",
+};
+
+const summaryMetricGridStyle: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+    gap: 16,
+};
+
+const summaryMetricLabelRowStyle: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
     marginBottom: 8,
 };
 
-const summaryValueStyle: React.CSSProperties = {
-    fontSize: 16,
+const summaryMetricValueStyle: React.CSSProperties = {
+    fontSize: 28,
     fontWeight: 700,
+    lineHeight: 1.1,
+};
+
+const summaryInfoIconStyle: React.CSSProperties = {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "var(--text-muted)",
+    cursor: "help",
+};
+
+const summaryDividerStyle: React.CSSProperties = {
+    height: 1,
+    background: "var(--border)",
+    margin: "18px 0",
+};
+
+const summaryDetailsGridStyle: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+    gap: 14,
+};
+
+const summaryDetailLabelStyle: React.CSSProperties = {
+    fontSize: 11,
+    textTransform: "uppercase",
+    letterSpacing: "0.08em",
+    color: "var(--text-muted)",
+    marginBottom: 6,
+};
+
+const summaryDetailValueStyle: React.CSSProperties = {
+    fontSize: 14,
+    fontWeight: 600,
+    color: "var(--text-primary)",
 };
 
 const controlLabelStyle: React.CSSProperties = {

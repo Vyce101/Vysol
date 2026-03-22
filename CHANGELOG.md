@@ -17,6 +17,7 @@ All notable user-visible changes to this project will be documented in this file
 - Added a Safety Review Queue for extraction safety blocks, including one-shot recovery for already-collapsed blocked chunks and in-app chunk editing/testing.
 - Added inline chat renaming in the sidebar, with conflict-safe saves that preserve Recent ordering.
 - Added a world-specific `Re-ingest` settings editor for editing saved chunk settings, glean amount, world-local ingest prompts, and repaired-chunk reuse before starting a full rebuild.
+- Added a `New Nodes` entity-resolution metric that tracks graph growth since the last completed entity-resolution run when a saved baseline exists.
 
 ### Changed
 
@@ -36,6 +37,7 @@ All notable user-visible changes to this project will be documented in this file
 - Changed safety-review editing to show overlap separately from the editable chunk body and exposed a dedicated Graph Architect glean prompt in the prompt editor.
 - Changed `Re-embed All` to reuse active repaired chunk bodies when the locked ingest snapshot still matches, while full rebuild paths remain blocked until overrides are discarded.
 - Changed entity resolution to expose per-run unique-node embedding batch and delay controls in the UI.
+- Changed the entity-resolution modal to replace the old top stat-card strip with a split controls/last-run summary layout, rename exact-only result counters to `Exact Matches` and `Left Unchanged`, and move per-setting helper copy into tooltips.
 - Changed the ingest page to use one `Re-ingest` rebuild action with a read-only world snapshot on the main page and world-local saved prompt precedence (`world -> global -> default`) for ingest/entity-resolution prompts.
 - Changed full `Re-ingest` to optionally reuse repaired chunk overrides when the chunk map stays the same instead of forcing users through separate rebuild buttons and warning cards.
 - Changed the ingest UI so `Re-ingest` settings open in an in-page popup, `Books in This World` collapses inside the left control column, `Safety Queue` opens as an on-page workspace, and `Retry All Failures` appears only when failures exist.

@@ -143,6 +143,39 @@ def _mark_run_stale(world_id: str) -> dict[str, Any]:
     return state
 
 
+def _coerce_non_negative_int(value: Any) -> int | None:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_current_graph_node_count(world_id: str, meta: dict[str, Any]) -> int | None:
+    try:
+        return GraphStore(world_id).get_node_count()
+    except Exception:
+        return _coerce_non_negative_int(meta.get("total_nodes"))
+
+
+def _get_new_nodes_since_last_completed_resolution(world_id: str, meta: dict[str, Any]) -> int | None:
+    baseline = _coerce_non_negative_int(meta.get("entity_resolution_last_completed_graph_nodes"))
+    current_total = _get_current_graph_node_count(world_id, meta)
+    if baseline is None or current_total is None:
+        return None
+    return max(0, current_total - baseline)
+
+
+def _with_new_node_summary(world_id: str, payload: dict[str, Any], meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    enriched = dict(payload)
+    if meta is None:
+        if not world_meta_path(world_id).exists():
+            enriched["new_nodes_since_last_completed_resolution"] = None
+            return enriched
+        meta = _load_meta(world_id)
+    enriched["new_nodes_since_last_completed_resolution"] = _get_new_nodes_since_last_completed_resolution(world_id, meta)
+    return enriched
+
+
 def get_resolution_status(world_id: str) -> dict[str, Any]:
     with _get_lock(_state_locks, world_id):
         current = dict(_states.get(world_id, {}))
@@ -150,7 +183,7 @@ def get_resolution_status(world_id: str) -> dict[str, Any]:
     if current:
         if world_id not in _active_runs and _is_stale_in_progress(current):
             return _mark_run_stale(world_id)
-        return current
+        return _with_new_node_summary(world_id, current)
 
     if not world_meta_path(world_id).exists():
         return {}
@@ -167,7 +200,9 @@ def get_resolution_status(world_id: str) -> dict[str, Any]:
         meta.get("entity_resolution_mode"),
         meta.get("entity_resolution_exact_pass", True),
     )
-    return {
+    return _with_new_node_summary(
+        world_id,
+        {
         "status": meta.get("entity_resolution_status", "idle"),
         "phase": meta.get("entity_resolution_phase"),
         "message": meta.get("entity_resolution_message"),
@@ -187,7 +222,9 @@ def get_resolution_status(world_id: str) -> dict[str, Any]:
         "review_mode": meta.get("entity_resolution_review_mode", False),
         "include_normalized_exact_pass": _mode_uses_exact_pass(resolution_mode),
         "can_resume": False,
-    }
+        },
+        meta,
+    )
 
 
 def get_resolution_current(world_id: str) -> dict[str, Any]:
@@ -635,9 +672,19 @@ def _update_meta_from_state(world_id: str, state: dict[str, Any], graph_store: G
     meta["entity_resolution_exact_pass"] = state.get("include_normalized_exact_pass", True)
     meta["entity_resolution_updated_at"] = state.get("updated_at")
     if graph_store is not None:
-        meta["total_nodes"] = graph_store.get_node_count()
+        current_total_nodes = graph_store.get_node_count()
+        meta["total_nodes"] = current_total_nodes
         meta["total_edges"] = graph_store.get_edge_count()
+        if state.get("status") in {"complete", "completed"}:
+            meta["entity_resolution_last_completed_graph_nodes"] = current_total_nodes
+    elif state.get("status") in {"complete", "completed"}:
+        current_total_nodes = _coerce_non_negative_int(meta.get("total_nodes"))
+        if current_total_nodes is not None:
+            meta["entity_resolution_last_completed_graph_nodes"] = current_total_nodes
     _save_meta(world_id, meta)
+    baseline = _coerce_non_negative_int(meta.get("entity_resolution_last_completed_graph_nodes"))
+    current_total = _coerce_non_negative_int(meta.get("total_nodes"))
+    state["new_nodes_since_last_completed_resolution"] = None if baseline is None or current_total is None else max(0, current_total - baseline)
 
 
 async def start_entity_resolution(

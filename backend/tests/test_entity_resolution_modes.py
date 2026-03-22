@@ -64,6 +64,7 @@ def test_exact_only_mode_stops_after_normalized_match_pass(tmp_path, monkeypatch
     assert status["resolved_entities"] == 2
     assert status["unresolved_entities"] == 1
     assert status["auto_resolved_pairs"] == 1
+    assert status["new_nodes_since_last_completed_resolution"] == 0
     assert reloaded.get_node_count() == 2
     assert rebuild_calls == [["node-a", "node-c"]]
     assert all(event.get("phase") not in {"candidate_search", "chooser", "combiner"} for event in events)
@@ -110,13 +111,15 @@ def test_exact_then_ai_mode_runs_chooser_and_combiner(tmp_path, monkeypatch):
         candidate["score"] = 0.12
         return [candidate]
 
-    async def _fake_choose(anchor, candidates):
+    async def _fake_choose(anchor, candidates, *, world_id=None):
         assert anchor["node_id"] == "node-a"
         assert candidates[0]["node_id"] == "node-b"
+        assert world_id == "world-exact-then-ai"
         return ["node-b"], "Matched by test chooser"
 
-    async def _fake_combine(nodes):
+    async def _fake_combine(nodes, *, world_id=None):
         assert {node["node_id"] for node in nodes} == {"node-a", "node-b"}
+        assert world_id == "world-exact-then-ai"
         return "Alice Combined", "Merged entity"
 
     monkeypatch.setattr(engine, "_query_candidates", _fake_query_candidates)
@@ -226,6 +229,57 @@ def test_entity_resolution_status_exposes_embedding_controls(tmp_path, monkeypat
 
     assert status["embedding_batch_size"] == 7
     assert status["embedding_cooldown_seconds"] == 1.5
+
+
+def test_entity_resolution_status_tracks_new_nodes_since_last_completed_run(tmp_path, monkeypatch):
+    world_id = "world-new-nodes-since-resolution"
+    meta_path, store = _prepare_world(tmp_path, monkeypatch, world_id)
+    store.graph.add_node("node-a", display_name="Alice", description="Primary", claims=[], source_chunks=[])
+    store.graph.add_node("node-b", display_name="ALICE", description="Duplicate", claims=[], source_chunks=[])
+    store.save()
+
+    async def _fail_choose(*args, **kwargs):
+        raise AssertionError("Chooser should not run in exact-only mode.")
+
+    async def _fail_combine(*args, **kwargs):
+        raise AssertionError("Combiner should not run in exact-only mode.")
+
+    async def _fake_rebuild_unique_node_index(_world_id, active_store, batch_size, cooldown_seconds, abort_event=None):
+        assert batch_size == 32
+        assert cooldown_seconds == 0.0
+        return object()
+
+    monkeypatch.setattr(engine, "_choose_matches", _fail_choose)
+    monkeypatch.setattr(engine, "_combine_entities", _fail_combine)
+    monkeypatch.setattr(engine, "_rebuild_unique_node_index", _fake_rebuild_unique_node_index)
+
+    asyncio.run(engine.start_entity_resolution(world_id, 50, False, True, "exact_only"))
+
+    status = engine.get_resolution_status(world_id)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    assert status["new_nodes_since_last_completed_resolution"] == 0
+    assert meta["entity_resolution_last_completed_graph_nodes"] == 1
+
+    grown = graph_store.GraphStore(world_id)
+    grown.graph.add_node("node-c", display_name="Bob", description="Other", claims=[], source_chunks=[])
+    grown.graph.add_node("node-d", display_name="Cara", description="Other", claims=[], source_chunks=[])
+    grown.save()
+
+    refreshed_status = engine.get_resolution_status(world_id)
+
+    assert refreshed_status["new_nodes_since_last_completed_resolution"] == 2
+
+
+def test_entity_resolution_status_leaves_new_nodes_unavailable_without_completion_baseline(tmp_path, monkeypatch):
+    world_id = "world-new-nodes-no-baseline"
+    _, store = _prepare_world(tmp_path, monkeypatch, world_id)
+    store.graph.add_node("node-a", display_name="Alice", description="Primary", claims=[], source_chunks=[])
+    store.save()
+
+    status = engine.get_resolution_status(world_id)
+
+    assert status["new_nodes_since_last_completed_resolution"] is None
 
 
 def test_entity_resolution_start_uses_custom_embedding_controls(tmp_path, monkeypatch):
