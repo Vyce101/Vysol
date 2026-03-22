@@ -51,12 +51,10 @@ It gives you one place to:
 
 ## Where To Read Next
 
-
-[Start in 60 Seconds](docs/SETUP.md#start-in-60-seconds)
-
-- Setup and First Run: [docs/SETUP.md](docs/SETUP.md)
+- Setup and First Run (`Start in 60 Seconds`): [docs/SETUP.md](docs/SETUP.md)
 - Full App Walkthrough (Settings, Ingestion, and Chat): [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md)
-- System Architecture Diagram: [docs/DIAGRAM.md](docs/DIAGRAM.md)
 - Core Features (Entity Resolution, Graph Provenance, Context X-Ray): [docs/FEATURES.md](docs/FEATURES.md)
+- Changelog and Release History: [CHANGELOG.md](CHANGELOG.md)
+- System Architecture Diagram: [docs/DIAGRAM.md](docs/DIAGRAM.md)
 - License Terms: [LICENSE](LICENSE)
 - Commercial Licensing: [COMMERCIAL.md](COMMERCIAL.md)
