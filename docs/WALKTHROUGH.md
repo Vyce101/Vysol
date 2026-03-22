@@ -23,6 +23,11 @@ Per-key toggle behavior:
 - `OFF` means the key stays saved on disk but is skipped by `Fail Over` and `Round Robin`
 - The Settings sidebar shows how many keys are active versus how many are stored
 
+Cooldown behavior:
+
+- If all active Gemini keys are temporarily cooling down, VySol can wait and continue when a key becomes available again instead of always failing immediately
+- During ingest, this appears as `Waiting for API key cooldown`
+
 Need help getting a Google AI Studio key?
 
 - See [How To Get Google AI Studio API Keys](walkthrough/google-ai-studio-api-keys.md)
@@ -172,6 +177,26 @@ Basic flow:
 4. Save any custom prompts if you changed them.
 5. Click `Start Ingestion`.
 
+Reading the ingest progress header:
+
+- The main ingest header now stays stable at the world level instead of flipping between extraction and embedding worker events
+- `Chunks Extracted` means chunks whose graph extraction has been durably written
+- `Chunks Embedded` means chunks whose chunk vectors have been durably written
+- `Unique Graph Nodes` means the current unique nodes in the saved graph
+- `Embedded Unique Nodes` means how many current unique graph nodes already have embeddings in the unique-node index
+
+Important note about node counts:
+
+- `Unique Graph Nodes` and `Embedded Unique Nodes` reflect the current merged graph state, not raw per-chunk extraction totals
+- Those counts can change after entity resolution merges duplicate entities and refreshes unique-node embeddings
+
+Wait states during ingest:
+
+- `Queued for extraction slot` means extraction workers are busy and this run is waiting for an extraction slot
+- `Queued for embedding slot` means embedding workers are busy and this run is waiting for an embedding slot
+- `Waiting for API key cooldown` means the active Gemini key pool is temporarily cooling down and the run is waiting to continue
+- Short pauses in these states are normal and do not automatically mean the ingest failed
+
 After ingestion finishes:
 
 1. Click `Resolve Entities`.
@@ -235,6 +260,7 @@ Use the rebuild and retry actions based on what went wrong:
 Important behavior:
 
 - `Resume` is the normal path when you simply add another new source after a previous ingest
+- When you add or remove pending sources, the ingest action area now refreshes immediately so `Resume`, `Start Over`, and completion state stay in sync without leaving the page
 - `Re-embed All` is intentionally narrower than a full rebuild and will now explain when it is unsafe
 - `Re-embed All` can reuse active repaired chunk bodies, but full rebuild paths still require those overrides to be discarded first
 - `Retry` actions only repair failures inside the currently locked ingest; they do not apply new chunk settings

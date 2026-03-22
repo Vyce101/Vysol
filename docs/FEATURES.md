@@ -105,6 +105,21 @@ Important behavior:
 - When that happens, the UI points you to either `Retry`, `Resume`, `Re-ingest With Previous Settings`, or `Rechunk And Re-ingest` depending on what changed
 - `Re-ingest With Previous Settings` gives you a clean full rebuild path that reuses the world's locked prior chunk settings instead of the current draft values shown in the form
 
+## Stable Ingest Progress
+
+VySol now shows ingestion progress as a stable world-level summary instead of letting the header bounce between whichever worker reported activity last.
+
+Important behavior:
+
+- `Chunks Extracted` tracks chunks whose graph extraction has been durably written
+- `Chunks Embedded` tracks chunks whose chunk-vector embedding has been durably written
+- `Unique Graph Nodes` tracks the current unique nodes in the saved graph
+- `Embedded Unique Nodes` tracks how many current unique graph nodes already exist in the unique-node index
+- The node counters reflect the current merged graph state, not raw per-chunk extraction totals
+- Because of that, node counts can change after entity resolution merges duplicate entities and refreshes unique-node embeddings
+- Wait states such as `Queued for extraction slot`, `Queued for embedding slot`, and `Waiting for API key cooldown` are shown as secondary activity context instead of replacing the main progress summary
+- The floating global ingest panel stays compact and keeps the same calm world-level progress semantics without showing the full row set
+
 ## Safety Review Queue
 
 VySol now keeps extraction safety blocks in a durable review queue instead of leaving them as manual text-hunting work.
